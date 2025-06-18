@@ -1,0 +1,12 @@
+[package]
+name = "primitives"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+codec                                   = { workspace = true}
+serde                                   = { workspace = true}
+alloy-primitives                        = { workspace = true}
+anyhow                                  = { workspace = true}
+alloy-signer                            = { workspace = true}
+alloy-signer-local                      = { workspace = true}
