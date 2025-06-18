@@ -54,6 +54,12 @@ pub struct ProverNetwork {
     pub contest_response_receiver_channel: Arc<Mutex<Receiver<Contest>>>,
 }
 
+impl ProverNetwork {
+    pub fn new(redis_client: RedisClient, current_contest: Contest, proof_sender_channel: Sender<ProofData>, bid_sender_channel: Sender<BidRequest>, contest_response_receiver_channel: Receiver<Contest>) -> Self {
+        Self { redis_client, current_contest: Arc::new(Mutex::new(current_contest)), proof_sender_channel: Arc::new(Mutex::new(proof_sender_channel)), bid_sender_channel: Arc::new(Mutex::new(bid_sender_channel)), contest_response_receiver_channel: Arc::new(Mutex::new(contest_response_receiver_channel)) }
+    }
+}
+
 #[async_trait]
 impl ProverNetworkRpcServer for ProverNetwork {
     async fn submit_proof(&self, proof_data: ProofData) -> RpcResult<()> {
