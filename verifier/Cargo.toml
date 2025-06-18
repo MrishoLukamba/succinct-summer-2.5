@@ -4,3 +4,14 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+jsonrpsee                       = { workspace = true}
+anyhow                          = { workspace = true}
+tokio                           = { workspace = true}
+log                             = { workspace = true}
+redis                           = { workspace = true, features = ["tokio-comp"]}
+alloy-signer                    = { workspace = true }
+alloy-signer-local              = { workspace = true }
+serde_json                      = { workspace = true}
+sp1-sdk                         = { workspace = true}
+# local dependencies
+primitives                      = { path = "../primitives" }
