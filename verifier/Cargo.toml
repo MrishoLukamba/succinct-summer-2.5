@@ -9,6 +9,7 @@ anyhow                          = { workspace = true}
 tokio                           = { workspace = true}
 log                             = { workspace = true}
 redis                           = { workspace = true, features = ["tokio-comp"]}
+dotenv                          = { workspace = true}
 alloy-signer                    = { workspace = true }
 alloy-signer-local              = { workspace = true }
 serde_json                      = { workspace = true}

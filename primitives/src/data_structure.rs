@@ -1,10 +1,10 @@
+use alloy_primitives::{keccak256, Address, Signature as EcdsaSignature, B256};
 use serde::{Deserialize, Serialize};
-use alloy_primitives::{
-    Address, Signature as EcdsaSignature, B256, keccak256
-};
 
 pub const ETH_SIG_MSG_PREFIX: &str = "\x19Ethereum Signed Message:\n";
-const CONTEST_DURATION: u64 = 1000 * 60; // 1 minute
+pub const CONTEST_DURATION: u64 = 1000 * 40; // 40 seconds
+pub const PROOF_DURATION: u64 = 1000 * 20; // 20 seconds, this serves as also the time between 1 contest to another
+pub const CREDIT_SLASH: u64 = 1000; // 1000 credits per invalid proof
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct ProofData {
@@ -17,8 +17,16 @@ pub struct ProofHeader {
     pub proof_timestamp: u64,
     pub proof_signature: Vec<u8>,
     pub prover_address: String,
+    pub prover_name: String,
+    pub proof_status: ProofStatus,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub enum ProofStatus {
+    Accepted,
+    Rejected,
+    Pending,
+}
 
 impl ProofData {
     pub fn sanity_check(&self) -> Result<(), anyhow::Error> {
@@ -29,11 +37,13 @@ impl ProofData {
         msg.extend_from_slice(self.proof.as_slice());
 
         let hashed = keccak256(&msg);
-        let sig = EcdsaSignature::try_from(self.proof_header.proof_signature.as_slice()).map_err(|e| anyhow::anyhow!("Invalid signature: {}", e))?;
-        
-        match sig.recover_address_from_prehash(<&B256>::from(&hashed)){
+        let sig = EcdsaSignature::try_from(self.proof_header.proof_signature.as_slice())
+            .map_err(|e| anyhow::anyhow!("Invalid signature: {}", e))?;
+
+        match sig.recover_address_from_prehash(<&B256>::from(&hashed)) {
             Ok(pub_key) => {
-                let prover_address = Address::from_slice(&self.proof_header.prover_address.as_bytes());
+                let prover_address =
+                    Address::from_slice(&self.proof_header.prover_address.as_bytes());
                 if pub_key != prover_address {
                     return Err(anyhow::anyhow!("Invalid signature"));
                 }
@@ -61,7 +71,6 @@ pub struct BidResponse {
     pub input: Vec<u8>,
     pub contest_id: u64,
 }
-
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub enum BidStatus {
@@ -91,6 +100,7 @@ pub struct ProverProfile {
     pub prover_credits: u64,
     pub prover_team: Team,
     pub bids: Vec<BidRequest>,
+    pub proofs: Vec<ProofData>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -99,12 +109,19 @@ pub enum Team {
     Pink,
     Green,
     Orange,
-    Purple
+    Purple,
 }
 
 impl ProverProfile {
-    pub fn new( prover_name: String, prover_team: Team, prover_address: String) -> Self {
-        Self { prover_address: prover_address.to_string(), prover_name, prover_credits: 0, prover_team, bids: Vec::new() }
+    pub fn new(prover_name: String, prover_team: Team, prover_address: String) -> Self {
+        Self {
+            prover_address: prover_address.to_string(),
+            prover_name,
+            prover_credits: 0,
+            prover_team,
+            bids: Vec::new(),
+            proofs: Vec::new(),
+        }
     }
 }
 
@@ -122,12 +139,25 @@ pub struct Contest {
     pub bids: Vec<BidRequest>,
     pub winner: Option<BidRequest>,
     pub reward: u64,
+    pub status: ContestStatus,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub enum ContestStatus {
+    Live,
+    Ended,
+    NotStarted,
+}
+impl Default for ContestStatus {
+    fn default() -> Self {
+        Self::NotStarted
+    }
 }
 
 impl Contest {
     pub fn calculate_winner(&self) -> Option<BidRequest> {
         todo!()
-    } 
+    }
     pub fn is_live(&self) -> bool {
         self.start_time <= self.end_time && self.end_time - self.start_time < CONTEST_DURATION
     }
@@ -147,5 +177,4 @@ impl Contest {
     pub fn get_winner(&self) -> Option<&BidRequest> {
         self.winner.as_ref()
     }
-    
 }

@@ -19,3 +19,4 @@ serde_json                              = { version = "1.0.127", features = ["al
 sp1-sdk                                 = { version = "5.0.5"}
 alloy-signer                            = { version = "1.0.12" }
 alloy-signer-local                      = { version = "1.0.12" }
+dotenv                                  = { version = "0.15.0" }

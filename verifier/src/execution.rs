@@ -1,5 +1,5 @@
-use primitives::data_structure::{BidRequest, Contest, ProofData};
 use anyhow::Error;
+use primitives::data_structure::{BidRequest, Contest, ProofData};
 
 pub trait VerifierExecutor {
     fn start_contest(&self);
@@ -10,27 +10,35 @@ pub trait VerifierExecutor {
 }
 
 pub struct VerifierExecutorImpl {
-    current_contest: Option<Contest>,
+    pub current_contest: Contest,
 }
 
-// impl VerifierExecutor for VerifierExecutorImpl {
-//     fn start_contest(&self) {
-//         todo!()
-//     }
+impl VerifierExecutorImpl {
+    pub fn new() -> Self {
+        Self {
+            current_contest: Contest::default(),
+        }
+    }
+}
 
-//     fn end_contest(&self) -> Result<Contest, Error> {
-//         todo!()
-//     }
+impl VerifierExecutor for VerifierExecutorImpl {
+    fn start_contest(&self) {
+        todo!()
+    }
 
-//     fn add_bid(&self, bid: BidRequest) -> Result<(), Error> {
-//         todo!()
-//     }
+    fn end_contest(&self) -> Result<Contest, Error> {
+        todo!()
+    }
 
-//     fn get_winner(&self) -> Result<Contest, Error> {
-//         todo!()
-//     }
+    fn add_bid(&self, bid: BidRequest) -> Result<(), Error> {
+        todo!()
+    }
 
-//     fn verify_proof(&self, proof: ProofData) -> Result<(), Error> {
-//         todo!()
-//     }
-// }
+    fn get_winner(&self) -> Result<Contest, Error> {
+        todo!()
+    }
+
+    fn verify_proof(&self, proof: ProofData) -> Result<(), Error> {
+        todo!()
+    }
+}
