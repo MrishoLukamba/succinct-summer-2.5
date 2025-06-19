@@ -258,7 +258,7 @@ impl ProverNetworkRpcServer for ProverNetwork {
             .map_err(|e| {
                 ErrorObject::owned(6, format!("Failed to register prover: {}", e), None::<()>)
             })?;
-        info!("Prover registered successfully: {:?}", prover_profile);
+        info!("Prover registered successfully: {:?}", prover_profile.prover_name);
         Ok(())
     }
 
@@ -298,11 +298,11 @@ impl ProverNetworkRpcServer for ProverNetwork {
             .map_err(|e| {
                 ErrorObject::owned(5, format!("Failed to get provers: {}", e), None::<()>)
             })?;
-        let provers = provers
+        let provers: Vec<ProverProfile> = provers
             .into_iter()
             .map(|(_, value)| serde_json::from_str::<ProverProfile>(&value).unwrap())
             .collect();
-        info!("Provers fetched successfully: {:?}", provers);
+        info!("Provers fetched successfully: {}", provers.len());
         Ok(provers)
     }
 
@@ -320,7 +320,7 @@ impl ProverNetworkRpcServer for ProverNetwork {
         let contests = self
             .redis_client
             .clone()
-            .lrange::<String, Vec<String>>("contest".to_string(), 0, -1)
+            .lrange::<String, Vec<String>>("contests".to_string(), 0, -1)
             .map_err(|e| {
                 ErrorObject::owned(5, format!("Failed to get contests: {}", e), None::<()>)
             })?;

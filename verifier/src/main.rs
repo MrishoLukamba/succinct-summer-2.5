@@ -1,9 +1,43 @@
+use clap::Parser;
+use log::LevelFilter;
+use simplelog::*;
+use std::fs::File;
+
+
+fn log_setup() -> Result<(), anyhow::Error> {
+    CombinedLogger::init(vec![
+        TermLogger::new(
+            LevelFilter::Info,
+            Config::default(),
+            TerminalMode::Mixed,
+            ColorChoice::Auto,
+        ),
+        WriteLogger::new(
+            LevelFilter::Info,
+            Config::default(),
+            File::create("succinct-log.log").unwrap(),
+        ),
+    ])
+    .unwrap();
+    Ok(())
+}
+
+#[derive(Parser)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    #[arg(short, long)]
+    pub port: u16, 
+}
+
 #[tokio::main]
 async fn main() {
+    log_setup().unwrap();
     // Load environment variables from .env file
     dotenv::dotenv().ok();
-
-    println!("Hello, world!");
+    let args = Args::parse();
+    let orchestrator = MainOrchestrator::new().unwrap();
+    orchestrator.start(args.port).await;
+    info!("Verifier is running");
 }
 
 // ================================ ORCHESTRATOR ================================
@@ -22,7 +56,7 @@ use crate::networking::{ProverNetwork, ProverNetworkRpcServer};
 pub use jsonrpsee::server::ServerBuilder;
 use log::info;
 use primitives::data_structure::{
-    BidRequest, BidResponse, BidStatus, Contest, ProofData,ProverProfile, ContestStatus,ProofStatus, CREDIT_SLASH, PROOF_DURATION,
+    BidRequest, BidResponse, BidStatus, Contest, ProofData,ProverProfile, ContestStatus,ProofStatus, CONTEST_DURATION, CREDIT_SLASH, PROOF_DURATION,
 };
 use redis::Client as RedisClient;
 use std::env;
@@ -82,10 +116,16 @@ impl MainOrchestrator {
     pub async fn listen_and_process_bids(&self) {
         let mut bid_receiver = self.bid_receiver_channel.lock().await;
         while let Some(mut bid) = bid_receiver.recv().await {
+            info!("Received bid: {:?} from {:?}", bid.bid_amount, bid.prover_name);
             // check if the contest is still running;
             let current_contest = self.execution_interface.current_contest.clone();
             if current_contest.is_live() {
-                self.execution_interface.add_bid(bid);
+                let is_valid = self.execution_interface.clone().add_bid(bid.clone());
+                if is_valid {
+                    info!("Bid accepted: {:?} from {:?}", bid.bid_amount, &bid.prover_name);
+                } else {
+                    info!("Bid rejected: {:?} from {:?}", bid.bid_amount, &bid.prover_name);
+                }
             } else {
                 bid.bid_status = BidStatus::Rejected;
                 // Store rejected bid in Redis
@@ -96,6 +136,7 @@ impl MainOrchestrator {
                 let mut prover_profile = serde_json::from_str::<ProverProfile>(&prover_profile).expect("Failed to deserialize prover profile");
                 prover_profile.bids.push(bid.clone());
                 self.redis_client.clone().hset::<String, String, String, String>("provers".to_string(), bid.prover_address.clone(), serde_json::to_string(&prover_profile).unwrap()).expect("Failed to store prover profile");
+                info!("Bid rejected: {:?} from {:?}", bid.bid_amount, bid.prover_name);
             }
         }
     }
@@ -104,10 +145,34 @@ impl MainOrchestrator {
         // always check the status of the current contest and if it is ended, wait for the proof duration to start a new contest
         loop {
             let contest = self.execution_interface.current_contest.clone();
-            if contest.status == ContestStatus::Ended {
-                // wait for the proof duration to start a new contest
-                sleep(Duration::from_secs(PROOF_DURATION)).await;
-                self.execution_interface.start_contest();
+            match contest.status {
+                ContestStatus::Live => {
+                    // wait for the contest duration to start a new contest
+                    sleep(Duration::from_secs(CONTEST_DURATION)).await;
+                    self.execution_interface.clone().end_contest();
+                    info!("Contest {} ended", contest.contest_id);
+                }
+                ContestStatus::Ended => {
+                    if !self.redis_client.is_open() {
+                        self.redis_client.get_connection().expect("Failed to get connection");
+                    }
+                    self.redis_client.clone().rpush::<String, String, String>("contests".to_string(), serde_json::to_string(&contest).unwrap()).expect("Failed to store contest in Redis");
+                    // wait for the proof duration to start a new contest
+                    sleep(Duration::from_secs(PROOF_DURATION)).await;
+                    if !self.redis_client.is_open() {
+                        self.redis_client.get_connection().expect("Failed to get connection");
+                    }
+                    let next_id = self.redis_client.clone().llen::<String, u64>("contest".to_string()).expect("Failed to get next contest id");
+                    self.execution_interface.clone().start_contest(next_id);
+                    
+                },
+                ContestStatus::NotStarted => {
+                    if !self.redis_client.is_open() {
+                        self.redis_client.get_connection().expect("Failed to get connection");
+                    }
+                    let next_id = self.redis_client.clone().llen::<String, u64>("contest".to_string()).expect("Failed to get next contest id");
+                    self.execution_interface.clone().start_contest(next_id);
+                }
             }
         }
     }
@@ -118,7 +183,8 @@ impl MainOrchestrator {
             let contest = self.execution_interface.current_contest.clone();
             if contest.status == ContestStatus::Ended {
                 // get the winner
-                let winner = contest.calculate_winner();
+                let mut execution_interface = self.execution_interface.clone();
+                let winner = execution_interface.get_winner();
                 if let Some(winner) = winner {
                     // store the winner in redis
                     self.store_contest_in_redis(&contest).await;
@@ -154,6 +220,7 @@ impl MainOrchestrator {
         let mut proof_receiver = self.proof_receiver_channel.lock().await;
         loop {
             while let Some(mut proof_data) = proof_receiver.recv().await {
+                info!("Received proof: {:?} from {:?}", proof_data.proof, proof_data.proof_header.prover_name);
                 // check if its within the proving window
                 let current_contest = self.execution_interface.current_contest.clone();
                 if current_contest.is_live()
@@ -247,5 +314,6 @@ impl MainOrchestrator {
             proof_processor,
             winner_poller
         );
+    
     }
 }

@@ -14,5 +14,8 @@ alloy-signer                    = { workspace = true }
 alloy-signer-local              = { workspace = true }
 serde_json                      = { workspace = true}
 sp1-sdk                         = { workspace = true}
+rand                            = { workspace = true}
+clap                            = { workspace = true}
+simplelog                       = { workspace = true}
 # local dependencies
 primitives                      = { path = "../primitives" }

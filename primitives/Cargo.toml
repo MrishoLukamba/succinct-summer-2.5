@@ -10,3 +10,5 @@ alloy-primitives                        = { workspace = true}
 anyhow                                  = { workspace = true}
 alloy-signer                            = { workspace = true}
 alloy-signer-local                      = { workspace = true}
+sp1-sdk                                 = { workspace = true}
+serde_json                              = { workspace = true}

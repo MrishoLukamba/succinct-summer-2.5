@@ -1,15 +1,19 @@
 use alloy_primitives::{keccak256, Address, Signature as EcdsaSignature, B256};
 use serde::{Deserialize, Serialize};
+use sp1_sdk::{SP1ProofWithPublicValues, SP1VerifyingKey};
+
 
 pub const ETH_SIG_MSG_PREFIX: &str = "\x19Ethereum Signed Message:\n";
 pub const CONTEST_DURATION: u64 = 1000 * 40; // 40 seconds
 pub const PROOF_DURATION: u64 = 1000 * 20; // 20 seconds, this serves as also the time between 1 contest to another
 pub const CREDIT_SLASH: u64 = 1000; // 1000 credits per invalid proof
+pub const CONTEST_REWARD: u64 = 1500; // 1500 credits per contest
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct ProofData {
     pub proof_header: ProofHeader,
-    pub proof: Vec<u8>,
+    pub proof: SP1ProofWithPublicValues,
+    pub verify_key: SP1VerifyingKey,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -31,10 +35,13 @@ pub enum ProofStatus {
 impl ProofData {
     pub fn sanity_check(&self) -> Result<(), anyhow::Error> {
         // verify proof with proof signature and prover address
+        let binding = serde_json::to_string(&self.proof).unwrap();
+        let encoded_proof = binding.as_bytes();
+        
         let mut msg = Vec::<u8>::new();
         msg.extend_from_slice(ETH_SIG_MSG_PREFIX.as_bytes());
-        msg.extend_from_slice(self.proof.len().to_string().as_bytes());
-        msg.extend_from_slice(self.proof.as_slice());
+        msg.extend_from_slice(encoded_proof.len().to_string().as_bytes());
+        msg.extend_from_slice(encoded_proof);
 
         let hashed = keccak256(&msg);
         let sig = EcdsaSignature::try_from(self.proof_header.proof_signature.as_slice())
@@ -93,7 +100,7 @@ impl BidStatus {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct ProverProfile {
     pub prover_address: String,
     pub prover_name: String,
@@ -155,9 +162,6 @@ impl Default for ContestStatus {
 }
 
 impl Contest {
-    pub fn calculate_winner(&self) -> Option<BidRequest> {
-        todo!()
-    }
     pub fn is_live(&self) -> bool {
         self.start_time <= self.end_time && self.end_time - self.start_time < CONTEST_DURATION
     }
@@ -166,7 +170,7 @@ impl Contest {
         self.end_time = self.start_time + CONTEST_DURATION;
     }
     pub fn end_contest(&mut self) {
-        self.end_time = std::time::Instant::now().elapsed().as_secs();
+        self.status = ContestStatus::Ended;
     }
     pub fn add_bid(&mut self, bid: BidRequest) {
         self.bids.push(bid);

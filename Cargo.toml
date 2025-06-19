@@ -20,3 +20,6 @@ sp1-sdk                                 = { version = "5.0.5"}
 alloy-signer                            = { version = "1.0.12" }
 alloy-signer-local                      = { version = "1.0.12" }
 dotenv                                  = { version = "0.15.0" }
+rand                                    = { version = "0.8.5" }
+clap                                    = { version = "4.5.28", features = ["derive"] }
+simplelog                               = "^0.12.0"
