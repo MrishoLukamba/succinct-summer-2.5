@@ -36,6 +36,8 @@ struct Args {
     pub prover_name: String,
     #[arg(short, long)]
     pub prover_team: Option<String>,
+    #[arg(short, long, default_value = "memory")]
+    pub storage: String,
 }
 
 #[derive(Parser)]
@@ -195,7 +197,17 @@ async fn main() -> Result<(), anyhow::Error> {
 
     let args = Args::parse();
 
-    let client = Arc::new(Mutex::new(ProverClient::new().await?));
+    // Convert storage string to StorageType enum
+    let storage_type = match args.storage.to_lowercase().as_str() {
+        "redis" => client::StorageType::Redis,
+        "memory" => client::StorageType::InMemory,
+        _ => {
+            println!("❌ Invalid storage type: {}. Use 'memory' or 'redis'", args.storage);
+            std::process::exit(1);
+        }
+    };
+
+    let client = Arc::new(Mutex::new(ProverClient::new(storage_type).await?));
 
     println!("    ███████╗██╗   ██╗ ██████╗ ██████╗██╗███╗   ██╗ ██████╗████████╗");
     println!("    ██╔════╝██║   ██║██╔════╝██╔════╝██║████╗  ██║██╔════╝╚══██╔══╝");

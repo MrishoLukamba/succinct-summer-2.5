@@ -19,10 +19,117 @@ use sp1_sdk::{ProverClient as Sp1ProverClient, SP1Stdin};
 use std::env;
 use std::str::FromStr;
 use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use alloy_primitives::{keccak256, Address};
 use alloy_signer::k256::ecdsa::SigningKey;
 use alloy_signer_local::{LocalSigner, PrivateKeySigner};
+
+// ================================ STORAGE TRAIT ================================
+
+#[derive(Debug, Clone)]
+pub enum StorageType {
+    Redis,
+    InMemory,
+}
+
+pub trait Storage: Send + Sync {
+    fn store_prover_account(&self, account: &ProverAccount) -> Result<(), anyhow::Error>;
+    fn get_prover_account(&self) -> Result<ProverAccount, anyhow::Error>;
+    fn is_connected(&self) -> bool;
+}
+
+// ================================ IN-MEMORY STORAGE ================================
+
+struct InMemoryStorageInner {
+    prover_account: HashMap<String, String>,
+}
+
+pub struct InMemoryStorage {
+    inner: Arc<Mutex<InMemoryStorageInner>>,
+}
+
+impl InMemoryStorage {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(InMemoryStorageInner {
+                prover_account: HashMap::new(),
+            })),
+        }
+    }
+}
+
+impl Storage for InMemoryStorage {
+    fn store_prover_account(&self, account: &ProverAccount) -> Result<(), anyhow::Error> {
+        let serialized_account = serde_json::to_string(account)?;
+        let mut inner = self.inner.lock()
+            .map_err(|e| anyhow::anyhow!("Failed to lock storage: {}", e))?;
+        inner.prover_account.insert("my_prover_account".to_string(), serialized_account);
+        Ok(())
+    }
+
+    fn get_prover_account(&self) -> Result<ProverAccount, anyhow::Error> {
+        let inner = self.inner.lock()
+            .map_err(|e| anyhow::anyhow!("Failed to lock storage: {}", e))?;
+        
+        let account_json = inner.prover_account
+            .get("my_prover_account")
+            .ok_or_else(|| anyhow::anyhow!("No prover account found"))?;
+        
+        let account = serde_json::from_str::<ProverAccount>(account_json)?;
+        Ok(account)
+    }
+
+    fn is_connected(&self) -> bool {
+        true // In-memory storage is always "connected"
+    }
+}
+
+// ================================ REDIS STORAGE ================================
+
+pub struct RedisStorage {
+    client: RedisClient,
+}
+
+impl RedisStorage {
+    pub fn new() -> Result<Self, anyhow::Error> {
+        let redis_url = env::var("REDIS_URL")
+            .map_err(|e| anyhow::anyhow!("Failed to get REDIS_URL: {}", e))?;
+        let client = RedisClient::open(redis_url)?;
+        Ok(Self { client })
+    }
+}
+
+impl Storage for RedisStorage {
+    fn store_prover_account(&self, account: &ProverAccount) -> Result<(), anyhow::Error> {
+        let serialized_account = serde_json::to_string(account)?;
+        let _ = self.client.clone().set::<String, String, String>(
+            "my_prover_account".to_string(),
+            serialized_account,
+        )?;
+        Ok(())
+    }
+
+    fn get_prover_account(&self) -> Result<ProverAccount, anyhow::Error> {
+        if !self.client.is_open() {
+            self.client
+                .get_connection()
+                .map_err(|e| anyhow::anyhow!("Failed to reconnect to redis: {}", e))?;
+        }
+
+        let account_json = self.client
+            .clone()
+            .get::<String, String>("my_prover_account".to_string())?;
+        
+        let account = serde_json::from_str::<ProverAccount>(&account_json)?;
+        Ok(account)
+    }
+
+    fn is_connected(&self) -> bool {
+        self.client.is_open()
+    }
+}
 
 // ================================ CLIENT ================================
 
@@ -37,6 +144,7 @@ pub struct ProverClient {
     ws_client: WsClient,
     client: Client,
     execution: ExecutionClient,
+    storage_type: StorageType,
 }
 
 impl ProverClient {
@@ -51,7 +159,7 @@ impl ProverClient {
         Ok(())
     }
 
-    pub async fn new() -> Result<Self, anyhow::Error> {
+    pub async fn new(storage_type: StorageType) -> Result<Self, anyhow::Error> {
         let url = Self::get_url();
 
         let ws_client = WsClientBuilder::default()
@@ -66,11 +174,12 @@ impl ProverClient {
             .request_timeout(Duration::from_secs(120))
             .build_with_tokio(tx, rx);
 
-        let execution = ExecutionClient::new()?;
+        let execution = ExecutionClient::new(storage_type.clone())?;
         Ok(Self {
             ws_client,
             client,
             execution,
+            storage_type,
         })
     }
 
@@ -80,18 +189,16 @@ impl ProverClient {
         prover_team: Option<Team>,
     ) -> Result<(), anyhow::Error> {
         // check if prover is already registered
-        if !self.execution.redis_client.is_open() {
-            self.execution.redis_client.get_connection()?;
+        if !self.execution.storage.is_connected() {
+            return Err(anyhow::anyhow!("Storage not connected"));
         }
-        let prover_account = self
-            .execution
-            .redis_client
-            .clone()
-            .get::<String, String>("my_prover_account".to_string())?;
-        if !prover_account.is_empty() {
+        
+        // Try to get existing account, if it exists, return early
+        if let Ok(_) = self.execution.storage.get_prover_account() {
             return Ok(());
         }
-        // register locallt first
+        
+        // register locally first
         let key = PrivateKeySigner::random();
         let credential = key.clone().into_credential().to_bytes().to_vec();
         let prover_address = key.address().to_string();
@@ -197,44 +304,25 @@ impl ProverClient {
 
 // =============================== EXECUTION ================================
 pub struct ExecutionClient {
-    pub redis_client: RedisClient,
+    pub storage: Box<dyn Storage>,
 }
 
 impl ExecutionClient {
-    pub fn new() -> Result<Self, anyhow::Error> {
-        let redis_client = Self::start_redis_client()?;
-        Ok(Self { redis_client })
-    }
-
-    fn start_redis_client() -> Result<RedisClient, anyhow::Error> {
-        let redis_url =
-            env::var("REDIS_URL").map_err(|e| anyhow::anyhow!("Failed to get REDIS_URL: {}", e))?;
-        let redis_client = RedisClient::open(redis_url)?;
-        Ok(redis_client)
+    pub fn new(storage_type: StorageType) -> Result<Self, anyhow::Error> {
+        let storage: Box<dyn Storage> = match storage_type {
+            StorageType::Redis => Box::new(RedisStorage::new()?),
+            StorageType::InMemory => Box::new(InMemoryStorage::new()),
+        };
+        Ok(Self { storage })
     }
 
     pub fn register_prover(&self, prover_account: ProverAccount) -> Result<(), anyhow::Error> {
-        let serialized_prover_account = serde_json::to_string(&prover_account)?;
-        let _ = self.redis_client.clone().set::<String, String, String>(
-            "my_prover_account".to_string(),
-            serialized_prover_account,
-        )?;
+        self.storage.store_prover_account(&prover_account)?;
         Ok(())
     }
 
     pub fn get_prover_account(&self) -> Result<ProverAccount, anyhow::Error> {
-        if !self.redis_client.is_open() {
-            self.redis_client
-                .get_connection()
-                .map_err(|e| anyhow::anyhow!("Failed to reconnect to redis: {}", e))?;
-        };
-
-        let prover_account = self
-            .redis_client
-            .clone()
-            .get::<String, String>("my_prover_account".to_string())?;
-        let prover_account = serde_json::from_str::<ProverAccount>(&prover_account)?;
-        Ok(prover_account)
+        self.storage.get_prover_account()
     }
 
     pub async fn generate_proof(&self, req: BidResponse) -> Result<ProofData, anyhow::Error> {

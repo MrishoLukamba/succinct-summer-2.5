@@ -15,7 +15,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::Mutex;
 
-use crate::StorageLayer;
+use crate::Storage;
 
 #[rpc(server, client)]
 pub trait ProverNetworkRpc {
@@ -63,7 +63,7 @@ pub trait ProverNetworkRpc {
 
 #[derive(Clone)]
 pub struct ProverNetwork {
-    pub redis_service: StorageLayer,
+    pub storage: Arc<dyn Storage>,
     pub current_contest: Arc<Mutex<Contest>>,
     pub proof_sender_channel: Arc<Mutex<Sender<ProofData>>>,
     pub bid_sender_channel: Arc<Mutex<Sender<BidRequest>>>,
@@ -73,7 +73,7 @@ pub struct ProverNetwork {
 
 impl ProverNetwork {
     pub fn new(
-        redis_service: StorageLayer,
+        storage: Box<dyn Storage>,
         current_contest: Contest,
         proof_sender_channel: Sender<ProofData>,
         bid_sender_channel: Sender<BidRequest>,
@@ -81,7 +81,7 @@ impl ProverNetwork {
         proof_status_receiver_channel: Receiver<ProofData>,
     ) -> Self {
         Self {
-            redis_service,
+            storage: Arc::from(storage),
             current_contest: Arc::new(Mutex::new(current_contest)),
             proof_sender_channel: Arc::new(Mutex::new(proof_sender_channel)),
             bid_sender_channel: Arc::new(Mutex::new(bid_sender_channel)),
@@ -116,7 +116,7 @@ impl ProverNetworkRpcServer for ProverNetwork {
             proof_data.proof_header.proof_timestamp, proof_data.proof_header.prover_address
         );
 
-        let mut prover_profile = self.redis_service.get_prover_profile(&proof_data.proof_header.prover_name)
+        let mut prover_profile = self.storage.get_prover_profile(&proof_data.proof_header.prover_name)
             .map_err(|e| {
                 ErrorObject::owned(
                     3,
@@ -125,7 +125,7 @@ impl ProverNetworkRpcServer for ProverNetwork {
                 )
             })?;
         prover_profile.proofs.push(proof_data.clone());
-        self.redis_service.update_prover_profile(&prover_profile)
+        self.storage.update_prover_profile(&prover_profile)
             .map_err(|e| {
                 ErrorObject::owned(5, format!("Failed to store proof data: {}", e), None::<()>)
             })?;
@@ -209,7 +209,7 @@ impl ProverNetworkRpcServer for ProverNetwork {
         prover_address: String,
     ) -> RpcResult<()> {
         let prover_profile = ProverProfile::new(prover_name.clone(), prover_team, prover_address);
-        self.redis_service.store_prover_profile(&prover_profile)
+        self.storage.store_prover_profile(&prover_profile)
             .map_err(|e| {
                 ErrorObject::owned(6, format!("Failed to register prover: {}", e), None::<()>)
             })?;
@@ -239,7 +239,7 @@ impl ProverNetworkRpcServer for ProverNetwork {
     }
 
     async fn get_provers(&self) -> RpcResult<Vec<ProverProfile>> {
-        let provers = self.redis_service.get_all_provers()
+        let provers = self.storage.get_all_provers()
             .map_err(|e| {
                 ErrorObject::owned(5, format!("Failed to get provers: {}", e), None::<()>)
             })?;
@@ -248,7 +248,7 @@ impl ProverNetworkRpcServer for ProverNetwork {
     }
 
     async fn get_all_contests(&self) -> RpcResult<Vec<Contest>> {
-        let contests = self.redis_service.get_all_contests()
+        let contests = self.storage.get_all_contests()
             .map_err(|e| {
                 ErrorObject::owned(5, format!("Failed to get contests: {}", e), None::<()>)
             })?;
