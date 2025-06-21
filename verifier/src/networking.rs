@@ -6,7 +6,8 @@ use jsonrpsee::{
 };
 use log::info;
 use primitives::data_structure::{
-    BidRequest, BidResponse, Contest, ProofData, ProverProfile, Team,
+    BidRequest, BidResponse, Contest, ProofData, ProverProfile, Team, ETH_BLOCK_PROGRAM,
+    ETH_TXN_INPUT,
 };
 use redis::Commands;
 use redis::{Client as RedisClient, ConnectionLike};
@@ -14,8 +15,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::Mutex;
 
-const ETH_BLOCK_PROGRAM: &[u8] = include_bytes!("../../artifacts/rsp");
-const ETH_TXN_INPUT: &[u8] = include_bytes!("../../artifacts/buffer.bin");
+use crate::StorageLayer;
 
 #[rpc(server, client)]
 pub trait ProverNetworkRpc {
@@ -48,6 +48,7 @@ pub trait ProverNetworkRpc {
     #[subscription(name = "watch_current_contest", unsubscribe = "unsub_watch_current_contest", item = Contest)]
     async fn watch_current_contest(&self) -> SubscriptionResult;
 
+    /// Watch the current proof execution
     #[subscription(name = "watch_proof_status", unsubscribe = "unsub_watch_proof_status", item = ProofData)]
     async fn watch_proof_status(&self) -> SubscriptionResult;
 
@@ -62,7 +63,7 @@ pub trait ProverNetworkRpc {
 
 #[derive(Clone)]
 pub struct ProverNetwork {
-    pub redis_client: RedisClient,
+    pub redis_service: StorageLayer,
     pub current_contest: Arc<Mutex<Contest>>,
     pub proof_sender_channel: Arc<Mutex<Sender<ProofData>>>,
     pub bid_sender_channel: Arc<Mutex<Sender<BidRequest>>>,
@@ -72,7 +73,7 @@ pub struct ProverNetwork {
 
 impl ProverNetwork {
     pub fn new(
-        redis_client: RedisClient,
+        redis_service: StorageLayer,
         current_contest: Contest,
         proof_sender_channel: Sender<ProofData>,
         bid_sender_channel: Sender<BidRequest>,
@@ -80,7 +81,7 @@ impl ProverNetwork {
         proof_status_receiver_channel: Receiver<ProofData>,
     ) -> Self {
         Self {
-            redis_client,
+            redis_service,
             current_contest: Arc::new(Mutex::new(current_contest)),
             proof_sender_channel: Arc::new(Mutex::new(proof_sender_channel)),
             bid_sender_channel: Arc::new(Mutex::new(bid_sender_channel)),
@@ -115,23 +116,7 @@ impl ProverNetworkRpcServer for ProverNetwork {
             proof_data.proof_header.proof_timestamp, proof_data.proof_header.prover_address
         );
 
-        if !self.redis_client.is_open() {
-            self.redis_client.get_connection().map_err(|e| {
-                ErrorObject::owned(
-                    3,
-                    format!("Failed to reconnect to redis: {}", e),
-                    None::<()>,
-                )
-            })?;
-        }
-
-        let prover_profile = self
-            .redis_client
-            .clone()
-            .hget::<String, String, String>(
-                "provers".to_string(),
-                proof_data.proof_header.prover_name.clone(),
-            )
+        let mut prover_profile = self.redis_service.get_prover_profile(&proof_data.proof_header.prover_name)
             .map_err(|e| {
                 ErrorObject::owned(
                     3,
@@ -139,22 +124,8 @@ impl ProverNetworkRpcServer for ProverNetwork {
                     None::<()>,
                 )
             })?;
-        let mut prover_profile =
-            serde_json::from_str::<ProverProfile>(&prover_profile).map_err(|e| {
-                ErrorObject::owned(
-                    4,
-                    format!("Failed to deserialize prover profile: {}", e),
-                    None::<()>,
-                )
-            })?;
         prover_profile.proofs.push(proof_data.clone());
-        self.redis_client
-            .clone()
-            .hset::<String, String, String, String>(
-                "provers".to_string(),
-                proof_data.proof_header.prover_name.clone(),
-                serde_json::to_string(&prover_profile).unwrap(),
-            )
+        self.redis_service.update_prover_profile(&prover_profile)
             .map_err(|e| {
                 ErrorObject::owned(5, format!("Failed to store proof data: {}", e), None::<()>)
             })?;
@@ -238,27 +209,14 @@ impl ProverNetworkRpcServer for ProverNetwork {
         prover_address: String,
     ) -> RpcResult<()> {
         let prover_profile = ProverProfile::new(prover_name.clone(), prover_team, prover_address);
-        if !self.redis_client.is_open() {
-            // reconnect to redis
-            self.redis_client.get_connection().map_err(|e| {
-                ErrorObject::owned(
-                    5,
-                    format!("Failed to reconnect to redis: {}", e),
-                    None::<()>,
-                )
-            })?;
-        }
-        self.redis_client
-            .clone()
-            .hset::<String, String, String, String>(
-                "provers".to_string(),
-                prover_name,
-                serde_json::to_string(&prover_profile).unwrap(),
-            )
+        self.redis_service.store_prover_profile(&prover_profile)
             .map_err(|e| {
                 ErrorObject::owned(6, format!("Failed to register prover: {}", e), None::<()>)
             })?;
-        info!("Prover registered successfully: {:?}", prover_profile.prover_name);
+        info!(
+            "Prover registered successfully: {:?}",
+            prover_profile.prover_name
+        );
         Ok(())
     }
 
@@ -281,54 +239,20 @@ impl ProverNetworkRpcServer for ProverNetwork {
     }
 
     async fn get_provers(&self) -> RpcResult<Vec<ProverProfile>> {
-        if !self.redis_client.is_open() {
-            // reconnect to redis
-            self.redis_client.get_connection().map_err(|e| {
-                ErrorObject::owned(
-                    5,
-                    format!("Failed to reconnect to redis: {}", e),
-                    None::<()>,
-                )
-            })?;
-        }
-        let provers = self
-            .redis_client
-            .clone()
-            .hgetall::<String, Vec<(String, String)>>("provers".to_string())
+        let provers = self.redis_service.get_all_provers()
             .map_err(|e| {
                 ErrorObject::owned(5, format!("Failed to get provers: {}", e), None::<()>)
             })?;
-        let provers: Vec<ProverProfile> = provers
-            .into_iter()
-            .map(|(_, value)| serde_json::from_str::<ProverProfile>(&value).unwrap())
-            .collect();
         info!("Provers fetched successfully: {}", provers.len());
         Ok(provers)
     }
 
     async fn get_all_contests(&self) -> RpcResult<Vec<Contest>> {
-        if !self.redis_client.is_open() {
-            // reconnect to redis
-            self.redis_client.get_connection().map_err(|e| {
-                ErrorObject::owned(
-                    5,
-                    format!("Failed to reconnect to redis: {}", e),
-                    None::<()>,
-                )
-            })?;
-        }
-        let contests = self
-            .redis_client
-            .clone()
-            .lrange::<String, Vec<String>>("contests".to_string(), 0, -1)
+        let contests = self.redis_service.get_all_contests()
             .map_err(|e| {
                 ErrorObject::owned(5, format!("Failed to get contests: {}", e), None::<()>)
             })?;
-        let contests = contests
-            .into_iter()
-            .map(|value| serde_json::from_str::<Contest>(&value).unwrap())
-            .collect();
-        info!("Contests fetched successfully ");
+        info!("Contests fetched successfully");
         Ok(contests)
     }
 

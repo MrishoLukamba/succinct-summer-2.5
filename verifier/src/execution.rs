@@ -1,5 +1,7 @@
 use anyhow::Error;
-use primitives::data_structure::{BidRequest, Contest, ProofData, CONTEST_DURATION, CONTEST_REWARD, ContestStatus};
+use primitives::data_structure::{
+    BidRequest, Contest, ContestStatus, ProofData, CONTEST_DURATION, CONTEST_REWARD,
+};
 use rand::Rng;
 use sp1_sdk::{ProverClient, SP1ProvingKey, SP1VerifyingKey};
 pub trait VerifierExecutor {
@@ -25,7 +27,6 @@ impl VerifierExecutorImpl {
 
 impl VerifierExecutor for VerifierExecutorImpl {
     fn start_contest(&mut self, next_id: u64) {
-    
         let new_contest = Contest {
             contest_id: next_id,
             start_time: std::time::Instant::now().elapsed().as_secs(),
@@ -42,8 +43,12 @@ impl VerifierExecutor for VerifierExecutorImpl {
         self.current_contest.end_contest();
     }
 
-    fn add_bid(&mut self, bid: BidRequest) -> bool{
-        let found = self.current_contest.bids.iter().find(|b| b.prover_address == bid.prover_address);
+    fn add_bid(&mut self, bid: BidRequest) -> bool {
+        let found = self
+            .current_contest
+            .bids
+            .iter()
+            .find(|b| b.prover_address == bid.prover_address);
         if found.is_some() {
             return false;
         }
@@ -52,16 +57,24 @@ impl VerifierExecutor for VerifierExecutorImpl {
     }
 
     fn get_winner(&mut self) -> Option<BidRequest> {
-        let mut bidders: Vec<(String,u64)> = Vec::new();
-        let random_number:u32 = rand::thread_rng().gen_range(0..self.current_contest.bids.len()).try_into().unwrap();
+        let mut bidders: Vec<(String, u64)> = Vec::new();
+        let random_number: u32 = rand::thread_rng()
+            .gen_range(0..self.current_contest.bids.len())
+            .try_into()
+            .unwrap();
         let bids = self.current_contest.bids.clone();
 
-        let total_bid_amount = self.current_contest.bids.iter().map(|b| b.bid_amount.pow(random_number)).sum::<u64>();
-        bids.iter().for_each(|b|{
+        let total_bid_amount = self
+            .current_contest
+            .bids
+            .iter()
+            .map(|b| b.bid_amount.pow(random_number))
+            .sum::<u64>();
+        bids.iter().for_each(|b| {
             let percentage_bid = b.bid_amount.pow(random_number) / total_bid_amount;
             bidders.push((b.prover_name.clone(), percentage_bid));
         });
-        bidders.sort_by_key(|(_,amount)| *amount); 
+        bidders.sort_by_key(|(_, amount)| *amount);
         let range = bidders.last().unwrap().1 - bidders.first().unwrap().1;
         let index_winner: usize = (range % (random_number as u64)) as usize;
         let winner = &bidders[index_winner];
@@ -76,6 +89,5 @@ impl VerifierExecutor for VerifierExecutorImpl {
             Ok(_) => Ok(()),
             Err(e) => Err(anyhow::anyhow!("Error verifying proof: {:?}", e)),
         }
-        
     }
 }

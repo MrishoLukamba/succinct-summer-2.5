@@ -3,7 +3,6 @@ use log::LevelFilter;
 use simplelog::*;
 use std::fs::File;
 
-
 fn log_setup() -> Result<(), anyhow::Error> {
     CombinedLogger::init(vec![
         TermLogger::new(
@@ -26,7 +25,7 @@ fn log_setup() -> Result<(), anyhow::Error> {
 #[command(author, version, about, long_about = None)]
 struct Args {
     #[arg(short, long)]
-    pub port: u16, 
+    pub port: u16,
 }
 
 #[tokio::main]
@@ -36,7 +35,10 @@ async fn main() {
     dotenv::dotenv().ok();
     let args = Args::parse();
     let orchestrator = MainOrchestrator::new().unwrap();
-    orchestrator.start(args.port).await;
+    if let Err(e) = orchestrator.start(args.port).await {
+        log::error!("Verifier failed to start: {}", e);
+        std::process::exit(1);
+    }
     info!("Verifier is running");
 }
 
@@ -53,23 +55,118 @@ mod networking;
 
 use crate::execution::{VerifierExecutor, VerifierExecutorImpl};
 use crate::networking::{ProverNetwork, ProverNetworkRpcServer};
+use anyhow::anyhow;
 pub use jsonrpsee::server::ServerBuilder;
 use log::info;
 use primitives::data_structure::{
-    BidRequest, BidResponse, BidStatus, Contest, ProofData,ProverProfile, ContestStatus,ProofStatus, CONTEST_DURATION, CREDIT_SLASH, PROOF_DURATION,
+    BidRequest, BidResponse, BidStatus, Contest, ContestStatus, ProofData, ProofStatus,
+    ProverProfile, CONTEST_DURATION, CREDIT_SLASH, PROOF_DURATION,
 };
 use redis::Client as RedisClient;
+use redis::Commands;
+use redis::ConnectionLike;
 use std::env;
 use std::sync::Arc;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
-use anyhow::anyhow;
-use redis::ConnectionLike;
-use redis::Commands;
+
+// =============================== STORAGE LAYER ===============================
+
+#[derive(Clone)]
+pub struct StorageLayer {
+    client: RedisClient,
+}
+
+impl StorageLayer {
+    pub fn new(client: RedisClient) -> Self {
+        Self { client }
+    }
+
+    pub fn get_connection(&self) -> Result<redis::Connection, anyhow::Error> {
+        self.client
+            .get_connection()
+            .map_err(|e| anyhow::anyhow!("Failed to connect to Redis: {}", e))
+    }
+
+    pub fn store_prover_profile(&self, profile: &ProverProfile) -> Result<(), anyhow::Error> {
+        let mut conn = self.get_connection()?;
+        let _ = conn.hset::<String, String, String, String>(
+            "provers".to_string(),
+            profile.prover_name.clone(),
+            serde_json::to_string(profile)?,
+        )
+        .map_err(|e| anyhow::anyhow!("Failed to store prover profile: {}", e))?;
+        Ok(())
+    }
+
+    pub fn get_prover_profile(&self, prover_name: &str) -> Result<ProverProfile, anyhow::Error> {
+        let mut conn = self.get_connection()?;
+        let profile_json: String = conn
+            .hget("provers".to_string(), prover_name.to_string())
+            .map_err(|e| anyhow::anyhow!("Failed to get prover profile: {}", e))?;
+        
+        let profile = serde_json::from_str(&profile_json)
+            .map_err(|e| anyhow::anyhow!("Failed to deserialize prover profile: {}", e))?;
+        Ok(profile)
+    }
+
+    pub fn update_prover_profile(&self, profile: &ProverProfile) -> Result<(), anyhow::Error> {
+        self.store_prover_profile(profile)
+    }
+
+    pub fn store_contest(&self, contest: &Contest) -> Result<(), anyhow::Error> {
+        let mut conn = self.get_connection()?;
+        conn.rpush::<String, String, String>(
+            "contests".to_string(),
+            serde_json::to_string(contest)?,
+        )
+        .map_err(|e| anyhow::anyhow!("Failed to store contest: {}", e))?;
+        Ok(())
+    }
+
+    pub fn get_contest_count(&self) -> Result<u64, anyhow::Error> {
+        let mut conn = self.get_connection()?;
+        let count = conn.llen("contests".to_string())
+            .map_err(|e| anyhow::anyhow!("Failed to get contest count: {}", e))?;
+        Ok(count)
+    }
+
+    pub fn get_all_provers(&self) -> Result<Vec<ProverProfile>, anyhow::Error> {
+        let mut conn = self.get_connection()?;
+        let provers_data: Vec<(String, String)> = conn
+            .hgetall("provers".to_string())
+            .map_err(|e| anyhow::anyhow!("Failed to get all provers: {}", e))?;
+        
+        let provers = provers_data
+            .into_iter()
+            .map(|(_, value)| {
+                serde_json::from_str::<ProverProfile>(&value)
+                    .map_err(|e| anyhow::anyhow!("Failed to deserialize prover: {}", e)).unwrap()
+            })
+            .collect();
+        Ok(provers)
+    }
+
+    pub fn get_all_contests(&self) -> Result<Vec<Contest>, anyhow::Error> {
+        let mut conn = self.get_connection()?;
+        let contests_data: Vec<String> = conn
+            .lrange("contests".to_string(), 0, -1)
+            .map_err(|e| anyhow::anyhow!("Failed to get all contests: {}", e))?;
+        
+        let contests = contests_data
+            .into_iter()
+            .map(|value| {
+                serde_json::from_str::<Contest>(&value)
+                    .map_err(|e| anyhow::anyhow!("Failed to deserialize contest: {}", e)).unwrap()
+            })
+            .collect();
+        Ok(contests)
+    }
+}
 
 pub struct MainOrchestrator {
-    pub redis_client: RedisClient,
+    pub redis_service: StorageLayer,
     pub rpc_interface: ProverNetwork,
     pub execution_interface: VerifierExecutorImpl,
     pub bid_receiver_channel: Arc<Mutex<Receiver<BidRequest>>>,
@@ -94,7 +191,7 @@ impl MainOrchestrator {
         let execution_interface = VerifierExecutorImpl::new();
 
         let rpc_interface = ProverNetwork::new(
-            redis_client.clone(),
+            StorageLayer::new(redis_client.clone()),
             Contest::default(),
             proof_sender_channel,
             bid_sender_channel,
@@ -103,7 +200,7 @@ impl MainOrchestrator {
         );
 
         Ok(Self {
-            redis_client,
+            redis_service: StorageLayer::new(redis_client),
             rpc_interface,
             execution_interface,
             bid_receiver_channel: Arc::new(Mutex::new(bid_receiver_channel)),
@@ -113,35 +210,44 @@ impl MainOrchestrator {
         })
     }
 
-    pub async fn listen_and_process_bids(&self) {
+    pub async fn listen_and_process_bids(&self) -> Result<(), anyhow::Error> {
         let mut bid_receiver = self.bid_receiver_channel.lock().await;
         while let Some(mut bid) = bid_receiver.recv().await {
-            info!("Received bid: {:?} from {:?}", bid.bid_amount, bid.prover_name);
+            info!(
+                "Received bid: {:?} from {:?}",
+                bid.bid_amount, bid.prover_name
+            );
             // check if the contest is still running;
             let current_contest = self.execution_interface.current_contest.clone();
             if current_contest.is_live() {
                 let is_valid = self.execution_interface.clone().add_bid(bid.clone());
                 if is_valid {
-                    info!("Bid accepted: {:?} from {:?}", bid.bid_amount, &bid.prover_name);
+                    info!(
+                        "Bid accepted: {:?} from {:?}",
+                        bid.bid_amount, &bid.prover_name
+                    );
                 } else {
-                    info!("Bid rejected: {:?} from {:?}", bid.bid_amount, &bid.prover_name);
+                    info!(
+                        "Bid rejected: {:?} from {:?}",
+                        bid.bid_amount, &bid.prover_name
+                    );
                 }
             } else {
                 bid.bid_status = BidStatus::Rejected;
                 // Store rejected bid in Redis
-                if !self.redis_client.is_open() {
-                    self.redis_client.get_connection().expect("Failed to get connection");
-                }
-                let prover_profile = self.redis_client.clone().hget::<String, String, String>("provers".to_string(), bid.prover_address.clone()).expect("Failed to get prover profile");
-                let mut prover_profile = serde_json::from_str::<ProverProfile>(&prover_profile).expect("Failed to deserialize prover profile");
+                let mut prover_profile = self.redis_service.get_prover_profile(&bid.prover_address)?;
                 prover_profile.bids.push(bid.clone());
-                self.redis_client.clone().hset::<String, String, String, String>("provers".to_string(), bid.prover_address.clone(), serde_json::to_string(&prover_profile).unwrap()).expect("Failed to store prover profile");
-                info!("Bid rejected: {:?} from {:?}", bid.bid_amount, bid.prover_name);
+                self.redis_service.update_prover_profile(&prover_profile)?;
+                info!(
+                    "Bid rejected: {:?} from {:?}",
+                    bid.bid_amount, bid.prover_name
+                );
             }
         }
+        Ok(())
     }
 
-    pub async fn start_new_contest(&self) {
+    pub async fn start_new_contest(&self) -> Result<(), anyhow::Error> {
         // always check the status of the current contest and if it is ended, wait for the proof duration to start a new contest
         loop {
             let contest = self.execution_interface.current_contest.clone();
@@ -153,24 +259,15 @@ impl MainOrchestrator {
                     info!("Contest {} ended", contest.contest_id);
                 }
                 ContestStatus::Ended => {
-                    if !self.redis_client.is_open() {
-                        self.redis_client.get_connection().expect("Failed to get connection");
-                    }
-                    self.redis_client.clone().rpush::<String, String, String>("contests".to_string(), serde_json::to_string(&contest).unwrap()).expect("Failed to store contest in Redis");
+                    self.redis_service.store_contest(&contest)?;
                     // wait for the proof duration to start a new contest
                     sleep(Duration::from_secs(PROOF_DURATION)).await;
-                    if !self.redis_client.is_open() {
-                        self.redis_client.get_connection().expect("Failed to get connection");
-                    }
-                    let next_id = self.redis_client.clone().llen::<String, u64>("contest".to_string()).expect("Failed to get next contest id");
+                    let next_id = self.redis_service.get_contest_count()?;
                     self.execution_interface.clone().start_contest(next_id);
-                    
-                },
+                    info!("New contest {} started after previous contest ended", next_id);
+                }
                 ContestStatus::NotStarted => {
-                    if !self.redis_client.is_open() {
-                        self.redis_client.get_connection().expect("Failed to get connection");
-                    }
-                    let next_id = self.redis_client.clone().llen::<String, u64>("contest".to_string()).expect("Failed to get next contest id");
+                    let next_id = self.redis_service.get_contest_count()?;
                     self.execution_interface.clone().start_contest(next_id);
                 }
             }
@@ -202,25 +299,19 @@ impl MainOrchestrator {
 
     pub async fn store_contest_in_redis(&self, contest: &Contest) {
         // Store the completed contest in Redis
-        if !self.redis_client.is_open() {
-            self.redis_client
-                .get_connection()
-                .expect("Failed to get connection");
+        if let Err(e) = self.redis_service.store_contest(contest) {
+            log::error!("Failed to store contest in Redis: {}", e);
         }
-        self.redis_client
-            .clone()
-            .rpush::<String, String, String>(
-                "contest".to_string(),
-                serde_json::to_string(contest).unwrap(),
-            )
-            .expect("Failed to store contest in Redis");
     }
 
-    pub async fn process_proof(&self) {
+    pub async fn process_proof(&self) -> Result<(), anyhow::Error> {
         let mut proof_receiver = self.proof_receiver_channel.lock().await;
         loop {
             while let Some(mut proof_data) = proof_receiver.recv().await {
-                info!("Received proof: {:?} from {:?}", proof_data.proof, proof_data.proof_header.prover_name);
+                info!(
+                    "Received proof: {:?} from {:?}",
+                    proof_data.proof, proof_data.proof_header.prover_name
+                );
                 // check if its within the proving window
                 let current_contest = self.execution_interface.current_contest.clone();
                 if current_contest.is_live()
@@ -230,15 +321,10 @@ impl MainOrchestrator {
                     // reject the proof
                     proof_data.proof_header.proof_status = ProofStatus::Rejected;
                     // deduct credit from the prover
-                    if !self.redis_client.is_open() {
-                        self.redis_client.get_connection().expect("Failed to get connection");
-                    }
-                    let prover_profile = self.redis_client.clone().hget::<String, String, String>("provers".to_string(), proof_data.proof_header.prover_name.clone()).expect("Failed to get prover profile");
-                    let mut prover_profile = serde_json::from_str::<ProverProfile>(&prover_profile).expect("Failed to deserialize prover profile");
-                    
+                    let mut prover_profile = self.redis_service.get_prover_profile(&proof_data.proof_header.prover_name)?;
                     prover_profile.prover_credits -= CREDIT_SLASH;
-                    self.redis_client.clone().hset::<String, String, String, String>("provers".to_string(), proof_data.proof_header.prover_name.clone(), serde_json::to_string(&prover_profile).unwrap()).expect("Failed to store prover profile");
-                    
+                    self.redis_service.update_prover_profile(&prover_profile)?;
+
                     self.proof_status_sender_channel
                         .lock()
                         .await
@@ -248,22 +334,14 @@ impl MainOrchestrator {
                     info!("Proof rejected: {:?}", proof_data.proof_header.prover_name);
                 }
 
-                match self
-                    .execution_interface
-                    .verify_proof(proof_data.clone())
-                    
-                {
+                match self.execution_interface.verify_proof(proof_data.clone()) {
                     Ok(_) => {
                         proof_data.proof_header.proof_status = ProofStatus::Accepted;
                         // add credit to the prover
-                        if !self.redis_client.is_open() {
-                            self.redis_client.get_connection().expect("Failed to get connection");
-                        }
-                        let prover_profile = self.redis_client.clone().hget::<String, String, String>("provers".to_string(), proof_data.proof_header.prover_name.clone()).expect("Failed to get prover profile");
-                        let mut prover_profile = serde_json::from_str::<ProverProfile>(&prover_profile).expect("Failed to deserialize prover profile");
+                        let mut prover_profile = self.redis_service.get_prover_profile(&proof_data.proof_header.prover_name)?;
                         prover_profile.prover_credits += current_contest.reward;
-                        self.redis_client.clone().hset::<String, String, String, String>("provers".to_string(), proof_data.proof_header.prover_name.clone(), serde_json::to_string(&prover_profile).unwrap()).expect("Failed to store prover profile");
-                        
+                        self.redis_service.update_prover_profile(&prover_profile)?;
+
                         self.proof_status_sender_channel
                             .lock()
                             .await
@@ -278,6 +356,7 @@ impl MainOrchestrator {
                 }
             }
         }
+        Ok(())
     }
 
     pub async fn start_rpc_server(&self, rpc_port: u16) -> Result<(), anyhow::Error> {
@@ -288,32 +367,35 @@ impl MainOrchestrator {
         let rpc_handler = self.rpc_interface.clone();
 
         let server = server_builder.build(url).await?;
-        let address = server
-            .local_addr()
-            .expect("failed to get address");
-        let handle = server
-            .start(rpc_handler.into_rpc());
+        let address = server.local_addr().expect("failed to get address");
+        let handle = server.start(rpc_handler.into_rpc());
 
         tokio::spawn(handle.stopped());
-        info!("RPC server started on {}", address);
+        info!("Succinct Verifier WebSocket RPC server started on {}", address);
         Ok(())
     }
 
-    pub async fn start(&self, rpc_port: u16) {
+    pub async fn start(&self, rpc_port: u16) -> Result<(), anyhow::Error> {
         // start the rpc server
-        self.start_rpc_server(rpc_port).await;
+        self.start_rpc_server(rpc_port).await?;
 
         let bid_processor = self.listen_and_process_bids();
         let contest_manager = self.start_new_contest();
         let proof_processor = self.process_proof();
         let winner_poller = self.process_contest_completion();
 
+        // Handle the contest manager result
+        let contest_result = contest_manager.await;
+        if let Err(e) = contest_result {
+            info!("Contest manager error: {}", e);
+        }
+
         tokio::join!(
             bid_processor,
-            contest_manager,
             proof_processor,
             winner_poller
         );
-    
+        
+        Ok(())
     }
 }

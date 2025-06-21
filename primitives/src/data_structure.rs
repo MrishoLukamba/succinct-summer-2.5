@@ -2,13 +2,14 @@ use alloy_primitives::{keccak256, Address, Signature as EcdsaSignature, B256};
 use serde::{Deserialize, Serialize};
 use sp1_sdk::{SP1ProofWithPublicValues, SP1VerifyingKey};
 
-
 pub const ETH_SIG_MSG_PREFIX: &str = "\x19Ethereum Signed Message:\n";
 pub const CONTEST_DURATION: u64 = 1000 * 40; // 40 seconds
 pub const PROOF_DURATION: u64 = 1000 * 20; // 20 seconds, this serves as also the time between 1 contest to another
 pub const CREDIT_SLASH: u64 = 1000; // 1000 credits per invalid proof
 pub const CONTEST_REWARD: u64 = 1500; // 1500 credits per contest
 
+pub const ETH_BLOCK_PROGRAM: &[u8] = include_bytes!("../../artifacts/rsp");
+pub const ETH_TXN_INPUT: &[u8] = include_bytes!("../../artifacts/buffer.bin");
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ProofData {
     pub proof_header: ProofHeader,
@@ -37,7 +38,7 @@ impl ProofData {
         // verify proof with proof signature and prover address
         let binding = serde_json::to_string(&self.proof).unwrap();
         let encoded_proof = binding.as_bytes();
-        
+
         let mut msg = Vec::<u8>::new();
         msg.extend_from_slice(ETH_SIG_MSG_PREFIX.as_bytes());
         msg.extend_from_slice(encoded_proof.len().to_string().as_bytes());
@@ -117,6 +118,19 @@ pub enum Team {
     Green,
     Orange,
     Purple,
+}
+
+impl From<String> for Team {
+    fn from(value: String) -> Self {
+        match value.as_str() {
+            "Blue" => Self::Blue,
+            "Pink" => Self::Pink,
+            "Green" => Self::Green,
+            "Orange" => Self::Orange,
+            "Purple" => Self::Purple,
+            _ => Self::Blue,
+        }
+    }
 }
 
 impl ProverProfile {

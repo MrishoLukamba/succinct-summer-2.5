@@ -18,4 +18,4 @@ rand                            = { workspace = true}
 clap                            = { workspace = true}
 simplelog                       = { workspace = true}
 # local dependencies
-primitives                      = { path = "../primitives" }
+primitives                      = { workspace = true }
