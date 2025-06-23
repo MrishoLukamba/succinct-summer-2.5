@@ -1,10 +1,12 @@
 use alloy_primitives::{keccak256, Address, Signature as EcdsaSignature, B256};
 use serde::{Deserialize, Serialize};
 use sp1_sdk::{SP1ProofWithPublicValues, SP1VerifyingKey};
+use rand::Rng;
+use log::info;
 
 pub const ETH_SIG_MSG_PREFIX: &str = "\x19Ethereum Signed Message:\n";
-pub const CONTEST_DURATION: u64 = 1000 * 40; // 40 seconds
-pub const PROOF_DURATION: u64 = 1000 * 20; // 20 seconds, this serves as also the time between 1 contest to another
+pub const CONTEST_DURATION: u64 = 1000 * 10; // 10 seconds
+pub const PROOF_DURATION: u64 = 1000 * 10; // 10 seconds, this serves as also the time between 1 contest to another
 pub const CREDIT_SLASH: u64 = 1000; // 1000 credits per invalid proof
 pub const CONTEST_REWARD: u64 = 1500; // 1500 credits per contest
 
@@ -177,7 +179,7 @@ impl Default for ContestStatus {
 
 impl Contest {
     pub fn is_live(&self) -> bool {
-        self.start_time <= self.end_time && self.end_time - self.start_time < CONTEST_DURATION
+        self.status == ContestStatus::Live
     }
     pub fn start_contest(&mut self) {
         self.start_time = std::time::Instant::now().elapsed().as_secs();
@@ -192,7 +194,63 @@ impl Contest {
     pub fn get_bids(&self) -> &Vec<BidRequest> {
         &self.bids
     }
-    pub fn get_winner(&self) -> Option<&BidRequest> {
-        self.winner.as_ref()
+    pub fn get_winner(&mut self) -> Option<BidRequest> {
+        if self.bids.is_empty() {
+            info!("No bids to select winner from");
+            return None;
+        }
+
+        let mut bidders: Vec<(String, u64)> = Vec::new();
+        let random_number: u32 = rand::thread_rng()
+            .gen_range(0..self.bids.len())
+            .try_into()
+            .unwrap();
+        
+        let bids = self.bids.clone();
+
+        let total_bid_amount = self
+            .bids
+            .iter()
+            .map(|b| b.bid_amount.pow(random_number))
+            .sum::<u64>();
+
+        if total_bid_amount == 0 {
+            info!("Total bid amount is 0, selecting random winner");
+            let random_index = rand::thread_rng().gen_range(0..bids.len());
+            let winner_bid = &bids[random_index];
+            self.winner = Some(winner_bid.clone());
+            return Some(winner_bid.clone());
+        }
+
+        bids.iter().for_each(|b| {
+            let percentage_bid = b.bid_amount.pow(random_number) / total_bid_amount;
+            bidders.push((b.prover_name.clone(), percentage_bid));
+        });
+
+        if bidders.is_empty() {
+            info!("No bidders after calculation");
+            return None;
+        }
+
+        bidders.sort_by_key(|(_, amount)| *amount);
+        
+        if bidders.len() == 1 {
+            // Only one bidder, they win
+            let winner = &bidders[0];
+            let winner_bid = bids.iter().find(|b| b.prover_name == winner.0).unwrap();
+            self.winner = Some(winner_bid.clone());
+            return Some(winner_bid.clone());
+        }
+
+        let range = bidders.last().unwrap().1 - bidders.first().unwrap().1;
+        let index_winner: usize = (range % (random_number as u64)) as usize;
+        
+        // Ensure index_winner is within bounds
+        let index_winner = index_winner % bidders.len();
+        
+        let winner = &bidders[index_winner];
+        let winner_bid = bids.iter().find(|b| b.prover_name == winner.0).unwrap();
+        self.winner = Some(winner_bid.clone());
+        Some(winner_bid.clone())
     }
 }

@@ -17,5 +17,7 @@ sp1-sdk                         = { workspace = true}
 rand                            = { workspace = true}
 clap                            = { workspace = true}
 simplelog                       = { workspace = true}
+sc-service                      = { workspace = true}
+futures-util                    = { workspace = true}
 # local dependencies
 primitives                      = { workspace = true }

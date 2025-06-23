@@ -4,7 +4,7 @@ use jsonrpsee::{
     types::ErrorObject,
     PendingSubscriptionSink, SubscriptionMessage,
 };
-use log::info;
+use log::{info, error};
 use primitives::data_structure::{
     BidRequest, BidResponse, Contest, ProofData, ProverProfile, Team, ETH_BLOCK_PROGRAM,
     ETH_TXN_INPUT,
@@ -65,15 +65,15 @@ pub trait ProverNetworkRpc {
 pub struct ProverNetwork {
     pub storage: Arc<dyn Storage>,
     pub current_contest: Arc<Mutex<Contest>>,
-    pub proof_sender_channel: Arc<Mutex<Sender<ProofData>>>,
-    pub bid_sender_channel: Arc<Mutex<Sender<BidRequest>>>,
+    pub proof_sender_channel: Sender<ProofData>,
+    pub bid_sender_channel: Sender<BidRequest>,
     pub contest_response_receiver_channel: Arc<Mutex<Receiver<Contest>>>,
     pub proof_status_receiver_channel: Arc<Mutex<Receiver<ProofData>>>,
 }
 
 impl ProverNetwork {
     pub fn new(
-        storage: Box<dyn Storage>,
+        storage: Arc<dyn Storage>,
         current_contest: Contest,
         proof_sender_channel: Sender<ProofData>,
         bid_sender_channel: Sender<BidRequest>,
@@ -81,13 +81,11 @@ impl ProverNetwork {
         proof_status_receiver_channel: Receiver<ProofData>,
     ) -> Self {
         Self {
-            storage: Arc::from(storage),
+            storage,
             current_contest: Arc::new(Mutex::new(current_contest)),
-            proof_sender_channel: Arc::new(Mutex::new(proof_sender_channel)),
-            bid_sender_channel: Arc::new(Mutex::new(bid_sender_channel)),
-            contest_response_receiver_channel: Arc::new(Mutex::new(
-                contest_response_receiver_channel,
-            )),
+            proof_sender_channel,
+            bid_sender_channel,
+            contest_response_receiver_channel: Arc::new(Mutex::new(contest_response_receiver_channel)),
             proof_status_receiver_channel: Arc::new(Mutex::new(proof_status_receiver_channel)),
         }
     }
@@ -96,12 +94,12 @@ impl ProverNetwork {
 #[async_trait]
 impl ProverNetworkRpcServer for ProverNetwork {
     async fn submit_proof(&self, proof_data: ProofData) -> RpcResult<()> {
+        info!("Proof received from prover: {:?}", proof_data.proof_header.prover_name);
         proof_data
             .sanity_check()
             .map_err(|e| ErrorObject::owned(1, format!("Invalid proof data: {}", e), None::<()>))?;
         self.proof_sender_channel
-            .lock()
-            .await
+            .clone()
             .send(proof_data.clone())
             .await
             .map_err(|e| {
@@ -144,10 +142,9 @@ impl ProverNetworkRpcServer for ProverNetwork {
     ) -> SubscriptionResult {
         let sink = pending_subscription.accept().await?;
 
-        self.bid_sender_channel
-            .lock()
-            .await
-            .send(bid_request.clone())
+        let bid_sender_channel = self.bid_sender_channel.clone();
+        info!("got the bid sender channel");
+        bid_sender_channel.send(bid_request.clone())
             .await
             .map_err(|e| {
                 ErrorObject::owned(
@@ -158,19 +155,28 @@ impl ProverNetworkRpcServer for ProverNetwork {
             })?;
         info!(
             "Bid submitted successfully: {:?}, by {:?}",
-            bid_request.bid_amount, bid_request.prover_address
+            bid_request.bid_amount, bid_request.prover_name
         );
         // wait for contest to finish and return if bidResponse if winner
-        let mut contest_response_receiver = self.contest_response_receiver_channel.lock().await;
-        let time_now = std::time::Instant::now().elapsed().as_secs();
-        let current_contest_time = self.current_contest.lock().await.end_time + 5;
-
-        let result = tokio::time::timeout(
-            tokio::time::Duration::from_secs(current_contest_time - time_now),
-            async move {
-                while let Some(contest) = contest_response_receiver.recv().await {
+        let contest_response_receiver = self.contest_response_receiver_channel.clone();
+        
+        let result = async move {
+            info!("🔄 submit_bid waiting for contest completion...");
+            // Get the receiver lock, receive one message, then release the lock
+            let contest = {
+                let mut receiver = contest_response_receiver.lock().await;
+                info!("🔒 Got receiver lock, waiting for message...");
+                let msg = receiver.recv().await;
+                info!("📨 Received message: {:?}", msg.as_ref().map(|c| c.contest_id));
+                msg
+            };
+            
+            match contest {
+                Some(contest) => {
+                    info!("📨 submit_bid received contest with winner: {:?}", contest.winner.as_ref().map(|w| &w.prover_name));
                     match contest.winner {
                         Some(winner) => {
+                            info!("🏆 Winner found: {:?}, checking if bidder {:?} won", winner.prover_address, bid_request.prover_address);
                             if winner.prover_address == bid_request.prover_address {
                                 info!(
                                     "Bid won: {:?}, by {:?}",
@@ -181,24 +187,34 @@ impl ProverNetworkRpcServer for ProverNetwork {
                                     input: ETH_TXN_INPUT.to_vec(),
                                     contest_id: contest.contest_id,
                                 };
-                                return Some(bid_response);
+                                info!("✅ Returning bid response for contest {}", contest.contest_id);
+                                Some(bid_response)
+                            } else {
+                                info!("Bid lost: winner was {:?}, but bid was from {:?}", winner.prover_address, bid_request.prover_address);
+                                info!("🔄 Contest completed but bidder lost");
+                                None
                             }
                         }
                         None => {
-                            continue;
+                            info!("Contest received but no winner yet");
+                            None
                         }
                     }
                 }
-                None
-            },
-        )
-        .await?;
-
+                None => {
+                    info!("📨 submit_bid channel closed, no more contests");
+                    None
+                }
+            }
+        }.await;
+        let bid_response_size = serde_json::to_vec(&result).unwrap().len();
+        info!("🎯 sending proof request to prover: {:?} of size: {:?} Mbs", result.is_some(),bid_response_size as u64 / (1024 * 1024));
         let json_value =
             SubscriptionMessage::new(sink.method_name(), sink.subscription_id(), &result).unwrap();
 
+        info!("📤 Sending response to client...");
         sink.send(json_value).await?;
-        info!("Generate proof sent to prover: {:?}", result);
+        info!("✅ proof request sent to prover");
         Ok(())
     }
 

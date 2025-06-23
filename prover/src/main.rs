@@ -1,5 +1,6 @@
 mod client;
 use clap::{Parser, Subcommand};
+use jsonrpsee::tracing::info;
 use std::io::{self, Write};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -50,13 +51,6 @@ struct CliCommand {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Register a prover with optional team
-    Register {
-        #[arg(short, long)]
-        name: String,
-        #[arg(short, long)]
-        team: Option<String>,
-    },
     /// Submit a bid with specified amount
     Bid {
         #[arg(short, long)]
@@ -79,28 +73,13 @@ async fn handle_command(
     client: Arc<Mutex<ProverClient>>,
 ) -> Result<bool, anyhow::Error> {
     match command {
-        Commands::Register { name, team } => {
-            println!("Registering prover: {} with team: {:?}", name, team);
-            let cloned_client = client.clone();
-            let client = cloned_client.lock().await;
-            let team = if let Some(team) = team {
-                let t: Team = team.into();
-                Some(t)
-            } else {
-                None
-            };
-            match client.register_prover(name, team).await {
-                Ok(_) => println!("✅ Prover registered successfully!"),
-                Err(e) => println!("❌ Registration failed: {}", e),
-            }
-        }
-
         Commands::Bid { amount } => {
             println!("Submitting bid with amount: {}", amount);
             // Note: This function runs indefinitely, so you might want to handle it differently
             // Perhaps spawn it as a background task
             let cloned_client = client.clone();
             let mut client = cloned_client.lock().await;
+            info!("we are here submitting bid");
             match client.submit_bid_and_proof(amount).await {
                 Ok(_) => println!("✅ Bid submitted successfully!"),
                 Err(e) => println!("❌ Bid submission failed: {}", e),
@@ -174,7 +153,6 @@ async fn handle_command(
 
 fn print_help() {
     println!("Available commands:");
-    println!("  register --name <NAME> [--team <TEAM>]  - Register a prover");
     println!("  bid --amount <AMOUNT>                   - Submit a bid");
     println!("  watch-proof                             - Start watching proof status");
     println!("  watch-contest                           - Start watching current contest");
@@ -183,7 +161,6 @@ fn print_help() {
     println!("  quit                                    - Exit the program");
     println!();
     println!("Examples:");
-    println!("  register --name alice --team Blue");
     println!("  bid --amount 1000");
     println!("  get-provers");
 }
@@ -209,6 +186,25 @@ async fn main() -> Result<(), anyhow::Error> {
 
     let client = Arc::new(Mutex::new(ProverClient::new(storage_type).await?));
 
+    // Automatically register the prover with the provided name and team
+    println!("🔄 Registering prover: {} with team: {:?}", args.prover_name, args.prover_team);
+    {
+        let client_guard = client.lock().await;
+        let team = if let Some(team) = args.prover_team {
+            let t: Team = team.into();
+            Some(t)
+        } else {
+            None
+        };
+        match client_guard.register_prover(args.prover_name.clone(), team).await {
+            Ok(_) => println!("✅ Prover registered successfully! \n \n"),
+            Err(e) => {
+                println!("❌ Registration failed: {}", e);
+                // Continue anyway, as the prover might already be registered
+            }
+        }
+    }
+
     println!("    ███████╗██╗   ██╗ ██████╗ ██████╗██╗███╗   ██╗ ██████╗████████╗");
     println!("    ██╔════╝██║   ██║██╔════╝██╔════╝██║████╗  ██║██╔════╝╚══██╔══╝");
     println!("    ███████╗██║   ██║██║     ██║     ██║██╔██╗ ██║██║        ██║   ");
@@ -216,10 +212,17 @@ async fn main() -> Result<(), anyhow::Error> {
     println!("    ███████║╚██████╔╝╚██████╗╚██████╗██║██║ ╚████║╚██████╗   ██║   ");
     println!("    ╚══════╝ ╚═════╝  ╚═════╝ ╚═════╝╚═╝╚═╝  ╚═══╝ ╚═════╝   ╚═╝   ");
     println!();
-    println!("             🔗 Succinct Prover Client CLI started! 🔗");
+    println!("          ██████╗ ██████╗  ██████╗ ██╗   ██╗███████╗██████╗        ");
+    println!("          ██╔══██╗██╔══██╗██╔═══██╗██║   ██║██╔════╝██╔══██╗       ");
+    println!("          ██████╔╝██████╔╝██║   ██║██║   ██║█████╗  ██████╔╝       ");
+    println!("          ██╔═══╝ ██╔══██╗██║   ██║╚██╗ ██╔╝██╔══╝  ██╔══██╗       ");
+    println!("          ██║     ██║  ██║╚██████╔╝ ╚████╔╝ ███████╗██║  ██║       ");
+    println!("          ╚═╝     ╚═╝  ╚═╝ ╚═════╝   ╚═══╝  ╚══════╝╚═╝  ╚═╝       ");
     println!();
-
-    println!("Type 'help' for available commands or 'quit' to exit.");
+    println!("             ✅ Succinct Prover Client CLI started! ✅ \n\n");
+    println!();
+    println!("          👤 Prover: {}", args.prover_name);
+    println!("          🔗 Type 'help' for available commands or 'quit' to exit.");
 
     // Track background tasks
     let mut background_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();

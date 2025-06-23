@@ -1,11 +1,16 @@
 use clap::Parser;
 use log::LevelFilter;
 use simplelog::*;
+use core::task;
 use std::fs::File;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use std::sync::{Arc as StdArc, Mutex as StdMutex};
+use futures_util::FutureExt;
+use log::error;
+use tokio::sync::mpsc::{self, Sender, Receiver};
+use tokio::time::{sleep, Duration};
 
 fn log_setup() -> Result<(), anyhow::Error> {
     CombinedLogger::init(vec![
@@ -51,12 +56,25 @@ async fn main() {
         }
     };
     
-    let orchestrator = MainOrchestrator::new(storage_type).unwrap();
-    if let Err(e) = orchestrator.start(args.port).await {
-        log::error!("Verifier failed to start: {}", e);
+    if let Err(e) = MainOrchestrator::start(storage_type, args.port).await {
+        println!("\n\n");
+        println!("    ███████╗██╗   ██╗ ██████╗ ██████╗██╗███╗   ██╗ ██████╗████████╗");
+        println!("    ██╔════╝██║   ██║██╔════╝██╔════╝██║████╗  ██║██╔════╝╚══██╔══╝");
+        println!("    ███████╗██║   ██║██║     ██║     ██║██╔██╗ ██║██║        ██║   ");
+        println!("    ╚════██║██║   ██║██║     ██║     ██║██║╚██╗██║██║        ██║   ");
+        println!("    ███████║╚██████╔╝╚██████╗╚██████╗██║██║ ╚████║╚██████╗   ██║   ");
+        println!("    ╚══════╝ ╚═════╝  ╚═════╝ ╚═════╝╚═╝╚═╝  ╚═══╝ ╚═════╝   ╚═╝   ");
+        println!();
+        println!("         ██╗   ██╗███████╗██████╗ ██╗███████╗██╗███████╗██████╗    ");
+        println!("         ██║   ██║██╔════╝██╔══██╗██║██╔════╝██║██╔════╝██╔══██╗   ");
+        println!("         ██████╔╝██████╔╝██║   ██║██║█████╗  ██║█████╗  ██████╔╝   ");
+        println!("         ╚██╗ ██╔╝██╔══╝  ██╔══██╗██║██╔══╝  ██║██╔══╝  ██╔══██╗   ");
+        println!("          ╚████╔╝ ███████╗██║  ██║██║██║     ██║███████╗██║  ██║   ");
+        println!("           ╚═══╝  ╚══════╝╚═╝  ╚═╝╚═╝╚═╝     ╚═╝╚══════╝╚═╝  ╚═╝   ");
+        println!();
+        println!("             ✅ Succinct Verifier Client CLI started! ✅ \n\n");
         std::process::exit(1);
     }
-    info!("Verifier is running");
 }
 
 // ================================ STORAGE TRAIT ================================
@@ -110,6 +128,7 @@ impl Storage for InMemoryStorage {
     }
 
     fn get_prover_profile(&self, prover_name: &str) -> Result<ProverProfile, anyhow::Error> {
+        info!("Getting prover profile for: {}", prover_name);
         let inner = self.inner.lock()
             .map_err(|e| anyhow::anyhow!("Failed to lock storage: {}", e))?;
         
@@ -280,7 +299,7 @@ mod networking;
 use crate::execution::{VerifierExecutor, VerifierExecutorImpl};
 use crate::networking::{ProverNetwork, ProverNetworkRpcServer};
 use anyhow::anyhow;
-pub use jsonrpsee::server::ServerBuilder;
+pub use jsonrpsee::server::{ServerBuilder,ServerConfigBuilder};
 use log::info;
 use primitives::data_structure::{
     BidRequest, BidResponse, BidStatus, Contest, ContestStatus, ProofData, ProofStatus,
@@ -290,146 +309,195 @@ use redis::Client as RedisClient;
 use redis::Commands;
 use redis::ConnectionLike;
 use std::env;
-use tokio::sync::mpsc::{Receiver, Sender};
-use tokio::time::{sleep, Duration};
 
 // ================================ ORCHESTRATOR ================================
 
+#[derive(Clone)]
 pub struct MainOrchestrator {
-    pub storage: Box<dyn Storage>,
+    pub storage: Arc<dyn Storage>,
     pub rpc_interface: ProverNetwork,
-    pub execution_interface: VerifierExecutorImpl,
-    pub bid_receiver_channel: Arc<Mutex<Receiver<BidRequest>>>,
-    pub contest_sender_channel: Arc<Mutex<Sender<Contest>>>,
-    pub proof_receiver_channel: Arc<Mutex<Receiver<ProofData>>>,
-    pub proof_status_sender_channel: Arc<Mutex<Sender<ProofData>>>,
+    pub execution_interface: Arc<Mutex<VerifierExecutorImpl>>,
+}
+
+// Channel message types for better type safety
+#[derive(Debug, Clone)]
+pub enum ContestCommand {
+    StartContest(u64),
+    EndContest,
+    CheckStatus,
+}
+
+#[derive(Clone)]
+pub enum ExecutionCommand {
+    AddBid(BidRequest),
+    GetWinner,
+    VerifyProof(ProofData),
+    GetContestStatus,
 }
 
 impl MainOrchestrator {
-    pub fn new(storage_type: StorageType) -> Result<Self, anyhow::Error> {
-        let storage: Box<dyn Storage> = match storage_type {
-            StorageType::Redis => Box::new(RedisStorage::new()?),
-            StorageType::InMemory => Box::new(InMemoryStorage::new()),
-        };
-
-        let (bid_sender_channel, bid_receiver_channel) = tokio::sync::mpsc::channel(10);
-        let (contest_sender_channel, contest_receiver_channel) = tokio::sync::mpsc::channel(10);
-        let (proof_sender_channel, proof_receiver_channel) = tokio::sync::mpsc::channel(10);
-        let (proof_status_sender_channel, proof_status_receiver_channel) =
-            tokio::sync::mpsc::channel(10);
-
-        let execution_interface = VerifierExecutorImpl::new();
-
-        // Create a separate storage instance for RPC interface
-        let rpc_storage: Box<dyn Storage> = match storage_type {
-            StorageType::Redis => Box::new(RedisStorage::new()?),
-            StorageType::InMemory => Box::new(InMemoryStorage::new()),
-        };
-
-        let rpc_interface = ProverNetwork::new(
-            rpc_storage,
-            Contest::default(),
-            proof_sender_channel,
-            bid_sender_channel,
-            contest_receiver_channel,
-            proof_status_receiver_channel,
-        );
-
-        Ok(Self {
-            storage,
-            rpc_interface,
-            execution_interface,
-            bid_receiver_channel: Arc::new(Mutex::new(bid_receiver_channel)),
-            contest_sender_channel: Arc::new(Mutex::new(contest_sender_channel)),
-            proof_receiver_channel: Arc::new(Mutex::new(proof_receiver_channel)),
-            proof_status_sender_channel: Arc::new(Mutex::new(proof_status_sender_channel)),
-        })
-    }
-
-    pub async fn listen_and_process_bids(&self) -> Result<(), anyhow::Error> {
-        let mut bid_receiver = self.bid_receiver_channel.lock().await;
+    pub async fn listen_and_process_bids(&self, mut bid_receiver: Receiver<BidRequest>) -> Result<(), anyhow::Error> {
+        info!("🎯 listen_and_process_bids task started!");
+        
         while let Some(mut bid) = bid_receiver.recv().await {
             info!(
-                "Received bid: {:?} from {:?}",
+                "📨 Received bid: {:?} from {:?}",
                 bid.bid_amount, bid.prover_name
             );
-            // check if the contest is still running;
-            let current_contest = self.execution_interface.current_contest.clone();
-            if current_contest.is_live() {
-                let is_valid = self.execution_interface.clone().add_bid(bid.clone());
+            
+            // Get contest status with minimal lock time
+            let is_live = {
+                let current_contest = self.execution_interface.lock().await.current_contest.clone();
+                current_contest.is_live()
+            };
+            
+            if is_live {
+                // Add bid with minimal lock time
+                let is_valid = {
+                    let mut execution = self.execution_interface.lock().await;
+                    execution.add_bid(bid.clone())
+                };
+                
                 if is_valid {
-                    info!(
-                        "Bid accepted: {:?} from {:?}",
-                        bid.bid_amount, &bid.prover_name
-                    );
+                    info!("✅ Bid accepted");
                 } else {
-                    info!(
-                        "Bid rejected: {:?} from {:?}",
-                        bid.bid_amount, &bid.prover_name
-                    );
+                    info!("❌ Bid rejected");
                 }
             } else {
+                info!("⏰ contest is not live");
                 bid.bid_status = BidStatus::Rejected;
-                // Store rejected bid in Redis
-                let mut prover_profile = self.storage.get_prover_profile(&bid.prover_address)?;
+                // Store rejected bid in storage
+                let mut prover_profile = self.storage.get_prover_profile(&bid.prover_name)?;
                 prover_profile.bids.push(bid.clone());
                 self.storage.update_prover_profile(&prover_profile)?;
-                info!(
-                    "Bid rejected: {:?} from {:?}",
-                    bid.bid_amount, bid.prover_name
-                );
+                info!("❌ Bid rejected, contest is not live");
             }
         }
+        info!("🏁 Bid processing task completed");
         Ok(())
     }
 
     pub async fn start_new_contest(&self) -> Result<(), anyhow::Error> {
-        // always check the status of the current contest and if it is ended, wait for the proof duration to start a new contest
+        info!("🎯 start_new_contest task started!");
+        
         loop {
-            let contest = self.execution_interface.current_contest.clone();
-            match contest.status {
+            info!("🔄 start_new_contest loop iteration");
+            
+            // Get contest status with minimal lock time
+            let contest_status = {
+                let contest = self.execution_interface.lock().await.current_contest.clone();
+                info!("Contest {} status: {:?}", contest.contest_id, contest.status);
+                contest.status
+            };
+            
+            match contest_status {
                 ContestStatus::Live => {
+                    info!("🏁 contest is live, waiting for CONTEST_DURATION");
                     // wait for the contest duration to start a new contest
-                    sleep(Duration::from_secs(CONTEST_DURATION)).await;
-                    self.execution_interface.clone().end_contest();
-                    info!("Contest {} ended", contest.contest_id);
+                    sleep(Duration::from_millis(CONTEST_DURATION)).await;
+                    
+                    // End contest with minimal lock time
+                    {
+                        let mut execution = self.execution_interface.lock().await;
+                        info!("🏁 Ending contest with {} bids", execution.current_contest.bids.len());
+                        execution.end_contest();
+                    }
+                    info!("✅ Contest ended");
                 }
                 ContestStatus::Ended => {
-                    self.storage.store_contest(&contest)?;
+                    info!("📦 storing contest and waiting for PROOF_DURATION");
+                    // Store contest with minimal lock time
+                    let contest_to_store = {
+                        let contest = self.execution_interface.lock().await.current_contest.clone();
+                        contest
+                    };
+                    self.storage.store_contest(&contest_to_store)?;
+                    
                     // wait for the proof duration to start a new contest
-                    sleep(Duration::from_secs(PROOF_DURATION)).await;
-                    let next_id = self.storage.get_contest_count()?;
-                    self.execution_interface.clone().start_contest(next_id);
-                    info!("New contest {} started after previous contest ended", next_id);
+                    sleep(Duration::from_millis(PROOF_DURATION)).await;
+                    
+                    let next_id = {
+                        let contest = self.execution_interface.lock().await.current_contest.clone();
+                        contest.contest_id + 1
+                    };
+                    
+                    // Start new contest with minimal lock time
+                    {
+                        let mut execution = self.execution_interface.lock().await;
+                        execution.start_contest(next_id);
+                    }
+                    
+                    info!("🚀 New contest started with ID: {}", next_id);
                 }
                 ContestStatus::NotStarted => {
-                    let next_id = self.storage.get_contest_count()?;
-                    self.execution_interface.clone().start_contest(next_id);
+                    info!("🎬 Starting first contest");
+                    let next_id = 0; // Start from contest ID 0
+                    
+                    // Start contest with minimal lock time
+                    {
+                        let mut execution = self.execution_interface.lock().await;
+                        execution.start_contest(next_id);
+                    }
+                    info!("🎬 First contest started with ID: {}", next_id);
                 }
             }
         }
     }
 
-    pub async fn process_contest_completion(&self) -> Result<(), anyhow::Error> {
-        // Poll for winner until one is found
-        loop {
-            let contest = self.execution_interface.current_contest.clone();
-            if contest.status == ContestStatus::Ended {
-                // get the winner
-                let mut execution_interface = self.execution_interface.clone();
-                let winner = execution_interface.get_winner();
-                if let Some(winner) = winner {
-                    // store the winner in redis
-                    self.store_contest_in_redis(&contest).await;
-                    info!("Winner found: {:?}", winner.prover_name);
-                    self.contest_sender_channel
-                        .lock()
-                        .await
-                        .send(contest)
-                        .await?;
+    pub async fn process_contest_completion(&self, contest_sender: Sender<Contest>) -> Result<(), anyhow::Error> {
+        info!("🎯 process_contest_completion task started!");
+
+        let (internal_contest_sender, mut internal_contest_receiver) = mpsc::channel::<Contest>(100);
+        let execution_interface = self.execution_interface.clone();
+        tokio::spawn(async move {
+            loop {
+                let (contest_ended, contest) = {
+                    let contest = execution_interface.lock().await.current_contest.clone();
+                    (contest.status == ContestStatus::Ended, contest)
+                };
+                if contest_ended {
+                    info!("🏆 Contest ended, sending to channel");
+                    if let Err(e) = internal_contest_sender.send(contest).await {
+                        error!("Failed to send contest: {}", e);
+                        break;
+                    }
+                    // Wait for the next contest to start before checking again
+                    loop {
+                        let contest = execution_interface.lock().await.current_contest.clone();
+                        if contest.status == ContestStatus::Live {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
                 }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        });
+
+        // The following logic is OUTSIDE the loop
+        // Get winner, store contest, send via channel, etc.
+        while let Some(mut contest) = internal_contest_receiver.recv().await {
+            let winner = {
+                info!("🔍 Getting winner, bids count: {}", &contest.bids.len());
+                contest.get_winner()
+            };
+
+            if let Some(winner) = winner {
+                
+                self.store_contest_in_redis(&contest).await;
+                info!("🏆 Winner found: {:?}", winner.prover_name);
+
+                if let Err(e) = contest_sender.send(contest).await {
+                    error!("Failed to send contest: {}", e);
+                } else {
+                    info!("📤 Contest with winner sent via channel to RPC");
+                }
+            } else {
+                info!("❌ No winner found - no bids");
             }
         }
+
+        Ok(())
     }
 
     pub async fn store_contest_in_redis(&self, contest: &Contest) {
@@ -439,55 +507,51 @@ impl MainOrchestrator {
         }
     }
 
-    pub async fn process_proof(&self) -> Result<(), anyhow::Error> {
-        let mut proof_receiver = self.proof_receiver_channel.lock().await;
-        loop {
-            while let Some(mut proof_data) = proof_receiver.recv().await {
-                info!(
-                    "Received proof: {:?} from {:?}",
-                    proof_data.proof, proof_data.proof_header.prover_name
-                );
-                // check if its within the proving window
-                let current_contest = self.execution_interface.current_contest.clone();
-                if current_contest.is_live()
-                    || current_contest.end_time + PROOF_DURATION
-                        < proof_data.proof_header.proof_timestamp
-                {
-                    // reject the proof
-                    proof_data.proof_header.proof_status = ProofStatus::Rejected;
-                    // deduct credit from the prover
+    pub async fn process_proof(&self, mut proof_receiver: Receiver<ProofData>, mut proof_status_sender: Sender<ProofData>) -> Result<(), anyhow::Error> {
+        info!("🎯 process_proof task started!");
+        
+        while let Some(mut proof_data) = proof_receiver.recv().await {
+            info!(
+                "Received proof: {:?} from {:?}",
+                proof_data.proof, proof_data.proof_header.prover_name
+            );
+            
+            // check if its within the proving window
+            let current_contest = self.execution_interface.lock().await.current_contest.clone();
+            if current_contest.is_live()
+                || current_contest.end_time + PROOF_DURATION
+                    < proof_data.proof_header.proof_timestamp
+            {
+                // reject the proof
+                proof_data.proof_header.proof_status = ProofStatus::Rejected;
+                // deduct credit from the prover
+                let mut prover_profile = self.storage.get_prover_profile(&proof_data.proof_header.prover_name)?;
+                prover_profile.prover_credits -= CREDIT_SLASH;
+                self.storage.update_prover_profile(&prover_profile)?;
+
+                // Send proof status via channel (no mutex needed)
+                if let Err(e) = proof_status_sender.send(proof_data.clone()).await {
+                    error!("Failed to send proof status: {}", e);
+                }
+                info!("Proof rejected: {:?}", proof_data.proof_header.prover_name);
+            }
+
+            match self.execution_interface.lock().await.verify_proof(proof_data.clone()) {
+                Ok(_) => {
+                    proof_data.proof_header.proof_status = ProofStatus::Accepted;
+                    // add credit to the prover
                     let mut prover_profile = self.storage.get_prover_profile(&proof_data.proof_header.prover_name)?;
-                    prover_profile.prover_credits -= CREDIT_SLASH;
+                    prover_profile.prover_credits += current_contest.reward;
                     self.storage.update_prover_profile(&prover_profile)?;
 
-                    self.proof_status_sender_channel
-                        .lock()
-                        .await
-                        .send(proof_data.clone())
-                        .await
-                        .expect("Failed to send proof status");
-                    info!("Proof rejected: {:?}", proof_data.proof_header.prover_name);
+                    // Send proof status via channel (no mutex needed)
+                    if let Err(e) = proof_status_sender.send(proof_data.clone()).await {
+                        error!("Failed to send proof status: {}", e);
+                    }
+                    info!("Proof accepted: {:?}", proof_data.proof_header.prover_name);
                 }
-
-                match self.execution_interface.verify_proof(proof_data.clone()) {
-                    Ok(_) => {
-                        proof_data.proof_header.proof_status = ProofStatus::Accepted;
-                        // add credit to the prover
-                        let mut prover_profile = self.storage.get_prover_profile(&proof_data.proof_header.prover_name)?;
-                        prover_profile.prover_credits += current_contest.reward;
-                        self.storage.update_prover_profile(&prover_profile)?;
-
-                        self.proof_status_sender_channel
-                            .lock()
-                            .await
-                            .send(proof_data.clone())
-                            .await
-                            .expect("Failed to send proof status");
-                        info!("Proof accepted: {:?}", proof_data.proof_header.prover_name);
-                    }
-                    Err(e) => {
-                        info!("Proof verification failed: {}", e);
-                    }
+                Err(e) => {
+                    info!("Proof verification failed: {}", e);
                 }
             }
         }
@@ -495,7 +559,12 @@ impl MainOrchestrator {
     }
 
     pub async fn start_rpc_server(&self, rpc_port: u16) -> Result<(), anyhow::Error> {
-        let server_builder = ServerBuilder::new();
+        let server_config = ServerConfigBuilder::new()
+            .max_request_body_size(1024 * 1024 * 25) // 25MB
+            .max_response_body_size(1024 * 1024 * 25) // 25MB
+            .build();
+
+        let server_builder = ServerBuilder::with_config(server_config);
 
         let url = format!("127.0.0.1:{}", rpc_port);
 
@@ -510,27 +579,90 @@ impl MainOrchestrator {
         Ok(())
     }
 
-    pub async fn start(&self, rpc_port: u16) -> Result<(), anyhow::Error> {
-        // start the rpc server
-        self.start_rpc_server(rpc_port).await?;
+    pub async fn start(storage_type: StorageType, rpc_port: u16) -> Result<(), anyhow::Error> {
+        info!("Succinct Verifier is running");
 
-        let bid_processor = self.listen_and_process_bids();
-        let contest_manager = self.start_new_contest();
-        let proof_processor = self.process_proof();
-        let winner_poller = self.process_contest_completion();
+        // Create channels for task communication first
+        let (bid_sender, bid_receiver) = mpsc::channel(100);
+        let (proof_sender, proof_receiver) = mpsc::channel(100);
+        let (proof_status_sender, proof_status_receiver) = mpsc::channel(100);
+        let (contest_sender, contest_receiver) = mpsc::channel(100);
 
-        // Handle the contest manager result
-        let contest_result = contest_manager.await;
-        if let Err(e) = contest_result {
-            info!("Contest manager error: {}", e);
-        }
+        // Create storage
+        let storage: Arc<dyn Storage> = match storage_type {
+            StorageType::Redis => Arc::new(RedisStorage::new()?),
+            StorageType::InMemory => Arc::new(InMemoryStorage::new()),
+        };
 
-        let _res = tokio::join!(
-            bid_processor,
-            proof_processor,
-            winner_poller
+        let execution_interface = Arc::new(Mutex::new(VerifierExecutorImpl::new()));
+
+        // Create RPC interface with the actual channels
+        let rpc_interface = ProverNetwork::new(
+            Arc::clone(&storage),
+            Contest::default(),
+            proof_sender.clone(),
+            bid_sender.clone(),
+            contest_receiver,
+            proof_status_receiver,
         );
+
+        // Create orchestrator with the proper RPC interface
+        let orchestrator = MainOrchestrator {
+            storage,
+            rpc_interface: rpc_interface.clone(),
+            execution_interface,
+        };
+
+        // Start the RPC server
+        orchestrator.start_rpc_server(rpc_port).await?;
+
+        info!("🚀 Starting background tasks with channels...");
+
+        // Spawn bid processing task
+        let orchestrator_clone = orchestrator.clone();
+        tokio::spawn(async move {
+            info!("🎯 Spawning listen_and_process_bids task");
+            let res = orchestrator_clone.listen_and_process_bids(bid_receiver).await;
+            if let Err(e) = res {
+                error!("❌ Error in listen_and_process_bids: {}", e);
+            }
+        });
+
+        // Spawn contest management task (self-contained, no channel needed)
+        let orchestrator_clone = orchestrator.clone();
+        tokio::spawn(async move {
+            info!("🎯 Spawning start_new_contest task");
+            let res = orchestrator_clone.start_new_contest().await;
+            if let Err(e) = res {
+                error!("❌ Error in start_new_contest: {}", e);
+            }
+        });
+
+        // Spawn proof processing task
+        let orchestrator_clone = orchestrator.clone();
+        tokio::spawn(async move {
+            info!("🎯 Spawning process_proof task");
+            let res = orchestrator_clone.process_proof(proof_receiver, proof_status_sender).await;
+            if let Err(e) = res {
+                error!("❌ Error in process_proof: {}", e);
+            }
+        });
+
+        // Spawn contest completion task
+        let orchestrator_clone = orchestrator.clone();
+        tokio::spawn(async move {
+            info!("🎯 Spawning process_contest_completion task");
+            let res = orchestrator_clone.process_contest_completion(contest_sender).await;
+            if let Err(e) = res {
+                error!("❌ Error in process_contest_completion: {}", e);
+            }
+        });
+
+        info!("✅ All background tasks spawned successfully with channels");
         
-        Ok(())
+        // Keep the main task alive
+        loop {
+            sleep(Duration::from_secs(1)).await;
+        }
     }
 }

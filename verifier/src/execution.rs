@@ -1,8 +1,9 @@
 use anyhow::Error;
+use log::info;
 use primitives::data_structure::{
     BidRequest, Contest, ContestStatus, ProofData, CONTEST_DURATION, CONTEST_REWARD,
 };
-use rand::Rng;
+
 use sp1_sdk::{ProverClient, SP1ProvingKey, SP1VerifyingKey};
 pub trait VerifierExecutor {
     fn start_contest(&mut self, next_id: u64);
@@ -27,6 +28,7 @@ impl VerifierExecutorImpl {
 
 impl VerifierExecutor for VerifierExecutorImpl {
     fn start_contest(&mut self, next_id: u64) {
+        info!("creating new contest");
         let new_contest = Contest {
             contest_id: next_id,
             start_time: std::time::Instant::now().elapsed().as_secs(),
@@ -50,6 +52,7 @@ impl VerifierExecutor for VerifierExecutorImpl {
             .iter()
             .find(|b| b.prover_address == bid.prover_address);
         if found.is_some() {
+            info!("bid already exists");
             return false;
         }
         self.current_contest.bids.push(bid);
@@ -57,34 +60,11 @@ impl VerifierExecutor for VerifierExecutorImpl {
     }
 
     fn get_winner(&mut self) -> Option<BidRequest> {
-        let mut bidders: Vec<(String, u64)> = Vec::new();
-        let random_number: u32 = rand::thread_rng()
-            .gen_range(0..self.current_contest.bids.len())
-            .try_into()
-            .unwrap();
-        let bids = self.current_contest.bids.clone();
-
-        let total_bid_amount = self
-            .current_contest
-            .bids
-            .iter()
-            .map(|b| b.bid_amount.pow(random_number))
-            .sum::<u64>();
-        bids.iter().for_each(|b| {
-            let percentage_bid = b.bid_amount.pow(random_number) / total_bid_amount;
-            bidders.push((b.prover_name.clone(), percentage_bid));
-        });
-        bidders.sort_by_key(|(_, amount)| *amount);
-        let range = bidders.last().unwrap().1 - bidders.first().unwrap().1;
-        let index_winner: usize = (range % (random_number as u64)) as usize;
-        let winner = &bidders[index_winner];
-        let winner_bid = bids.iter().find(|b| b.prover_name == winner.0).unwrap();
-        self.current_contest.winner = Some(winner_bid.clone());
-        Some(winner_bid.clone())
+        self.current_contest.get_winner()
     }
 
     fn verify_proof(&self, proof: ProofData) -> Result<(), Error> {
-        let prover_client = ProverClient::from_env();
+        let prover_client = ProverClient::local();
         match prover_client.verify(&proof.proof, &proof.verify_key) {
             Ok(_) => Ok(()),
             Err(e) => Err(anyhow::anyhow!("Error verifying proof: {:?}", e)),

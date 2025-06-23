@@ -155,7 +155,13 @@ impl ProverClient {
 
     async fn reconnect_ws_client(&mut self) -> Result<(), anyhow::Error> {
         let url = Self::get_url();
-        self.ws_client = WsClientBuilder::default().build(url).await?;
+        self.ws_client = WsClientBuilder::default()
+            .max_request_size(1024 * 1024 * 50)
+            .max_response_size(1024 * 1024 * 50)
+            .request_timeout(Duration::from_secs(120))
+            .connection_timeout(Duration::from_secs(500))
+            .build(url.clone())
+            .await?;
         Ok(())
     }
 
@@ -163,13 +169,15 @@ impl ProverClient {
         let url = Self::get_url();
 
         let ws_client = WsClientBuilder::default()
+            .max_request_size(1024 * 1024 * 50)
+            .max_response_size(1024 * 1024 * 50)
             .request_timeout(Duration::from_secs(120))
             .connection_timeout(Duration::from_secs(500))
             .build(url.clone())
             .await?;
 
         let uri = Url::parse(&url)?;
-        let (tx, rx) = WsTransportClientBuilder::default().build(uri).await?;
+        let (tx, rx) = WsTransportClientBuilder::default().max_request_size(1024 * 1024 * 50).max_response_size(1024 * 1024 * 50).build(uri).await?;
         let client = ClientBuilder::default()
             .request_timeout(Duration::from_secs(120))
             .build_with_tokio(tx, rx);
@@ -223,7 +231,7 @@ impl ProverClient {
         if !self.ws_client.is_connected() {
             self.reconnect_ws_client().await?;
         }
-
+       
         let prover_account = self.execution.get_prover_account()?;
 
         let bid = BidRequest {
@@ -236,17 +244,32 @@ impl ProverClient {
         let params = rpc_params!(bid);
         let mut subscription = self
             .ws_client
-            .subscribe::<BidResponse, _>("submit_bid", params, "unsub_submit_bid")
+            .subscribe::<Option<BidResponse>, _>("submit_bid", params, "unsub_submit_bid")
             .await?;
+    
         loop {
             let bid_response = subscription.next().await;
-            if let Some(Ok(ref bid_response)) = bid_response {
-                let proof = self.execution.generate_proof(bid_response.clone()).await?;
-                let params = rpc_params!(proof);
-                self.client.request::<(), _>("submit_proof", params).await?;
-            }
-            if let Some(Err(e)) = bid_response {
-                error!("Error watching bid response: {:?}", e);
+            
+            match bid_response {
+                Some(Ok(Some(bid_response))) => {
+                    info!("✅ WON! Received bid response: contest_id={}", bid_response.contest_id);
+                    let proof = self.execution.generate_proof(bid_response).await?;
+                    let params = rpc_params!(proof);
+                    self.client.request::<(), _>("submit_proof", params).await?;
+                    break Ok(());
+                }
+                Some(Ok(None)) => {
+                    info!("❌ Lost the contest, bid the next one");
+                    break Ok(());
+                }
+                Some(Err(e)) => {
+                    error!("Error watching bid response: {:?}", e);
+                    break Err(anyhow::anyhow!("Subscription error: {:?}", e));
+                }
+                None => {
+                    info!("❌ Subscription closed by server");
+                    break Ok(());
+                }
             }
         }
     }
@@ -304,14 +327,14 @@ impl ProverClient {
 
 // =============================== EXECUTION ================================
 pub struct ExecutionClient {
-    pub storage: Box<dyn Storage>,
+    pub storage: Arc<dyn Storage>,
 }
 
 impl ExecutionClient {
     pub fn new(storage_type: StorageType) -> Result<Self, anyhow::Error> {
-        let storage: Box<dyn Storage> = match storage_type {
-            StorageType::Redis => Box::new(RedisStorage::new()?),
-            StorageType::InMemory => Box::new(InMemoryStorage::new()),
+        let storage: Arc<dyn Storage> = match storage_type {
+            StorageType::Redis => Arc::new(RedisStorage::new()?),
+            StorageType::InMemory => Arc::new(InMemoryStorage::new()),
         };
         Ok(Self { storage })
     }
@@ -326,13 +349,13 @@ impl ExecutionClient {
     }
 
     pub async fn generate_proof(&self, req: BidResponse) -> Result<ProofData, anyhow::Error> {
-        let prover_client = Sp1ProverClient::from_env();
+        let prover_client = Sp1ProverClient::local();
 
         let start_time = std::time::Instant::now();
         let (_public_values, report) = prover_client
             .execute(
                 req.program.as_slice(),
-                &SP1Stdin::from(req.input.as_slice()),
+                SP1Stdin::from(req.input.as_slice()),
             )
             .run()?;
         let end_time = std::time::Instant::now();
@@ -346,7 +369,7 @@ impl ExecutionClient {
         let start_time = std::time::Instant::now();
         let (proving_key, verifying_key) = prover_client.setup(req.program.as_slice());
         let proof = prover_client
-            .prove(&proving_key, &SP1Stdin::from(req.input.as_slice()))
+            .prove(&proving_key, SP1Stdin::from(req.input.as_slice()))
             .run()?;
         let end_time = std::time::Instant::now();
 
@@ -359,7 +382,7 @@ impl ExecutionClient {
         let start_time = std::time::Instant::now();
         let (proving_key, verifying_key) = prover_client.setup(req.program.as_slice());
         let proof = prover_client
-            .prove(&proving_key, &SP1Stdin::from(req.input.as_slice()))
+            .prove(&proving_key, SP1Stdin::from(req.input.as_slice()))
             .run()?;
         let end_time = std::time::Instant::now();
         let duration = end_time.duration_since(start_time);
