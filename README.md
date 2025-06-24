@@ -4,6 +4,14 @@ An offchain succinct SP1 prover network that enables proving Ethereum blocks and
 
 Currently it supports only 1 precompiled Eth runtime with some transaction input
 
+More to come
+
+1. Being abke to run Reth Node and connect to this verifier via p2p (libp2p), hooking up the gossip protocol and get the blocks via block import and produce proofs.
+
+the proof-time is the block import time before finality.
+
+2. Other protocol support (Polkadot)
+3. 
 ## Architecture
 
 The project consists of two main components: **Prover** and **Verifier**, each running as separate services that communicate via JSON-RPC.
@@ -102,7 +110,10 @@ rustc --version
 cargo --version
 ```
 
-#### Redis Database
+#### Redis Database (Optional)
+Redis is **optional** for development and testing. The system supports both **in-memory storage** (default) and **Redis storage**.
+
+**For Production/Shared Storage:**
 Install Redis:
 
 **Ubuntu/Debian:**
@@ -135,6 +146,8 @@ redis-cli ping
 # Should return: PONG
 ```
 
+**Note:** For development and testing, you can use in-memory storage without installing Redis.
+
 ## Setup Instructions
 
 ### 1. Clone the Repository
@@ -147,7 +160,7 @@ cd succint-summer-2.5
 Create a `.env` file in the project root:
 
 ```bash
-# Redis configuration
+# Redis configuration (optional - only needed for Redis storage)
 REDIS_URL=redis://localhost:6379
 
 # Verifier node URL for prover to connect to
@@ -156,6 +169,10 @@ VERIFIER_NODE_URL=ws://localhost:5789
 # SP1 Prover configuration
 SP1_PROVER_URL=https://prover.succinct.xyz
 ```
+
+**Storage Options:**
+- **In-Memory Storage** (default): No additional setup required. Data is stored in memory and lost on restart.
+- **Redis Storage**: Requires Redis installation and `REDIS_URL` environment variable.
 
 ### 3. Build the Project
 ```bash
@@ -169,8 +186,11 @@ cargo build --release -p prover
 
 ### 4. Start the Verifier
 ```bash
-# Start the verifier server on port 5789
+# Start the verifier server on port 5789 with in-memory storage (default)
 ./target/release/verifier --port 5789
+
+# Or start with Redis storage
+./target/release/verifier --port 5789 --storage redis
 ```
 
 You should see:
@@ -189,6 +209,27 @@ You should see the ASCII art banner and CLI prompt:
 > 
 ```
 
+## Storage Options
+
+The system supports two storage backends:
+
+### In-Memory Storage (Default)
+- **Use Case**: Development, testing, single-instance deployment
+- **Pros**: No external dependencies, fast startup, simple setup
+- **Cons**: Data lost on restart, not suitable for production with multiple instances
+- **Command**: `./target/release/verifier --port 5789` (default)
+
+### Redis Storage
+- **Use Case**: Production, multi-instance deployment, data persistence
+- **Pros**: Data persistence, supports multiple verifier instances, scalable
+- **Cons**: Requires Redis installation and configuration
+- **Command**: `./target/release/verifier --port 5789 --storage redis`
+- **Requirements**: Redis server running and `REDIS_URL` environment variable set
+
+**Recommendation:**
+- Use **in-memory storage** for development and testing
+- Use **Redis storage** for production deployments
+
 ## Usage Instructions
 
 ### Verifier Commands
@@ -202,12 +243,6 @@ The verifier runs as a server and doesn't have interactive commands. It automati
 ### Prover Commands
 
 Once the prover CLI is running, you can use these commands:
-
-#### Register a Prover
-```bash
-> register --name Alice --team Blue
-✅ Prover registered successfully!
-```
 
 #### Submit a Bid
 ```bash
@@ -250,13 +285,12 @@ Once the prover CLI is running, you can use these commands:
 ## Network Interaction Flow
 
 1. **Start Verifier**: The verifier begins accepting connections and starts contest cycles
-2. **Start Prover**: Connect to the verifier network
-3. **Register**: Register your prover identity
-4. **Monitor**: Watch for active contests
-5. **Bid**: Submit bids when contests are live
-6. **Generate**: If you win, generate proofs using SP1
-7. **Submit**: Submit proofs for verification
-8. **Earn**: Receive credits for successful proofs
+2. **Start Prover**: Connect to the verifier network (automatically registers)
+3. **Monitor**: Watch for active contests
+4. **Bid**: Submit bids when contests are live
+5. **Generate**: If you win, generate proofs using SP1
+6. **Submit**: Submit proofs for verification
+7. **Earn**: Receive credits for successful proofs
 
 ## Troubleshooting
 
@@ -306,4 +340,6 @@ succint-summer-2.5/
 
 ## License
 
-[MIT licence] 
+MIT licence
+
+Just use it bro no string attached
