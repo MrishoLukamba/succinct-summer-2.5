@@ -1,0 +1,17 @@
+[package]
+name = "utils"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "wasm-shell"
+path = "src/main.rs"
+
+[dependencies]
+polkadot-primitives                        = { workspace = true }
+sp1-zkvm                                   = { workspace = true }
+sc-executor                                = { workspace = true }
+polkadot-node-core-pvf-common              = { workspace = true }
+sp-runtime                                 = { workspace = true }
+sp-state-machine                           = { workspace = true }
+sc-executor-common                         = { workspace = true }

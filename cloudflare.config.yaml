@@ -1,0 +1,5 @@
+tunnel: succinct-summer
+credentials-file: /Users/mrisholukamba/.cloudflared/4909f1bf-eae7-4792-99fd-7ab569c07a0c.json
+ingress:
+  - hostname: succinct-summer-verifier.vaneweb3.com
+    service: ws://localhost:2025

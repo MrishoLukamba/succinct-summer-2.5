@@ -1,5 +1,5 @@
 [workspace]
-members = [ "primitives","prover", "verifier"]
+members = [ "primitives","prover", "utils", "verifier","utils"]
 resolver = "2"
 
 [workspace.package]
@@ -25,7 +25,14 @@ clap                                    = { version = "4.5.28", features = ["der
 simplelog                               = { version = "0.12.0"}
 sc-service                              = { version = "0.46.0"}
 futures-util                            = { version = "0.3.31"}
-
+sp1-zkvm                                = { version = "5.0.8"}      
+sc-executor                             = { version = "0.43.0"}
+sp-state-machine                        = { version = "0.46.0"}
+polkadot-primitives                     = { version = "19.0.0"}
+polkadot-node-core-pvf-common           = { version = "20.0.0"}
+sp-runtime                              = { version = "42.0.0"}
+sc-executor-common                      = { version = "0.39.0"}
+polkadot-runtime                        = { version = "3.0.0"}
 
 #local dependencies
 primitives = { path = "primitives" }
